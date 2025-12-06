@@ -1,17 +1,15 @@
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
 import yt_dlp
 import os
 import tempfile
 import logging
 
-# --- إعدادات البوت ---
+# جلب التوكن من Railway
 TOKEN = os.environ.get("BOT_TOKEN")
 
-# فحص للتأكد من وجود التوكن
+# حماية في حال كنت تجربه على جهازك بدون توكن
 if not TOKEN:
-    print("خطأ: لم يتم وضع التوكن في إعدادات الموقع!")
-    # هذا توكن مؤقت فقط لكي لا ينهار الكود عند التجربة المحلية، لكنه لن يعمل على السيرفر بدونه
     TOKEN = "TOKEN_PLACEHOLDER"
 
 bot = telebot.TeleBot(TOKEN)
@@ -19,11 +17,13 @@ logging.basicConfig(level=logging.INFO)
 user_states = {}
 
 def main_menu():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    """إنشاء أزرار شفافة تظهر تحت الرسالة"""
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 2
     markup.add(
-        KeyboardButton("Download from TikTok"),
-        KeyboardButton("Download from Instagram"),
-        KeyboardButton("Bot Info")
+        InlineKeyboardButton("TikTok 🎵", callback_data="tiktok"),
+        InlineKeyboardButton("Instagram 📸", callback_data="instagram"),
+        InlineKeyboardButton("Bot Info ℹ️", callback_data="info")
     )
     return markup
 
@@ -31,36 +31,38 @@ def main_menu():
 def start(message):
     bot.send_message(
         message.chat.id,
-        "Welcome to the 2025 Downloader Bot!\nTikTok + Instagram (HD, No Watermark)",
+        "👋 Welcome! Choose a service:",
         reply_markup=main_menu()
     )
+
+# هذا الجزء الجديد للتعامل مع ضغطات الأزرار
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    user_id = call.from_user.id
+    
+    if call.data == "tiktok":
+        user_states[user_id] = "tiktok"
+        bot.answer_callback_query(call.id, "TikTok Selected")
+        bot.send_message(call.message.chat.id, "Send the TikTok link now 🎵")
+        
+    elif call.data == "instagram":
+        user_states[user_id] = "instagram"
+        bot.answer_callback_query(call.id, "Instagram Selected")
+        bot.send_message(call.message.chat.id, "Send the Instagram link now 📸")
+        
+    elif call.data == "info":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "Downloader Bot 2025\nOwner: @Ziad")
 
 @bot.message_handler(func=lambda m: True)
 def handler(message):
     text = message.text
     user_id = message.from_user.id
 
-    if text == "Download from TikTok":
-        user_states[user_id] = "tiktok"
-        bot.reply_to(message, "Send the TikTok link.", reply_markup=main_menu())
-        return
-
-    if text == "Download from Instagram":
-        user_states[user_id] = "instagram"
-        bot.reply_to(message, "Send the Instagram link.", reply_markup=main_menu())
-        return
-
-    if text == "Bot Info":
-        bot.reply_to(
-            message,
-            "Downloader Bot 2025\nOwner: @Ziad",
-            reply_markup=main_menu()
-        )
-        return
-
+    # التأكد أن المستخدم اختار خدمة وأن النص رابط
     if user_id in user_states and text.startswith("http"):
         url = text.strip()
-        status_msg = bot.reply_to(message, "Processing...")
+        status_msg = bot.reply_to(message, "⏳ Processing...")
 
         try:
             ydl_options = {
@@ -80,7 +82,7 @@ def handler(message):
                 files.sort()
 
                 if not files:
-                    bot.edit_message_text("Failed to download.", message.chat.id, status_msg.message_id)
+                    bot.edit_message_text("❌ Failed to find media.", message.chat.id, status_msg.message_id)
                     return
 
                 if len(files) == 1:
@@ -103,14 +105,14 @@ def handler(message):
                     for f in open_files: f.close()
 
             bot.delete_message(message.chat.id, status_msg.message_id)
-            bot.send_message(message.chat.id, "Done!", reply_markup=main_menu())
+            bot.send_message(message.chat.id, "✅ Done! Choose again:", reply_markup=main_menu())
             user_states.pop(user_id, None)
 
         except Exception as e:
-            bot.edit_message_text(f"Error: {e}", message.chat.id, status_msg.message_id)
+            bot.edit_message_text(f"❌ Error: {str(e)[:100]}", message.chat.id, status_msg.message_id)
             user_states.pop(user_id, None)
     else:
-        bot.reply_to(message, "Choose from menu first.", reply_markup=main_menu())
+        bot.reply_to(message, "⚠️ Please choose a service from the buttons first.", reply_markup=main_menu())
 
 if __name__ == "__main__":
     bot.infinity_polling()
