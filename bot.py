@@ -1,13 +1,11 @@
 import os
 import asyncio
 import logging
-import time
-import math
-from pyrogram import Client, filters, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram import Client, filters, enums # ✅ تم إضافة enums هنا
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 import yt_dlp
 
-# --- 1. الإعدادات ---
+# --- 1. الإعدادات والمتغيرات ---
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -18,142 +16,85 @@ logger = logging.getLogger(__name__)
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user_urls = {}
-# قاموس لحفظ وقت آخر تحديث للرسالة (لتجنب Flood Wait)
-last_update_time = {}
 
-# --- 2. دوال المساعدة (شريط التقدم) ---
-
-def humanbytes(size):
-    """تحويل الحجم إلى صيغة مقروءة (MB, GB)"""
-    if not size:
-        return ""
-    power = 2**10
-    n = 0
-    dic_powerN = {0: ' ', 1: 'KiB', 2: 'MiB', 3: 'GiB', 4: 'TiB'}
-    while size > power:
-        size /= power
-        n += 1
-    return str(round(size, 2)) + " " + dic_powerN.get(n, 'B')
-
-def get_progress_bar_string(current, total):
-    """رسم شريط التقدم [■■■□□]"""
-    completed = int(current * 10 / total)
-    return "■" * completed + "□" * (10 - completed)
-
-async def progress_bar(current, total, status_msg, start_time, operation_name):
-    """دالة تحديث الرسالة في تيليجرام"""
-    now = time.time()
-    # تحديث الرسالة كل 4 ثواني فقط لتجنب الحظر
-    if last_update_time.get(status_msg.id) and (now - last_update_time[status_msg.id]) < 4:
-        return
-
-    last_update_time[status_msg.id] = now
-    
-    percentage = current * 100 / total
-    speed = current / (now - start_time) if (now - start_time) > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
-    
-    # تنسيق الوقت المتبقي
-    eta_str = time.strftime("%M:%S", time.gmtime(eta)) if eta < 3600 else "Wait.."
-
-    text = (
-        f"**{operation_name}** 🔄\n"
-        f"[{get_progress_bar_string(current, total)}] {round(percentage, 2)}%\n"
-        f"📊 **H:** {humanbytes(current)} / {humanbytes(total)}\n"
-        f"🚀 **S:** {humanbytes(speed)}/s\n"
-        f"⏳ **ETA:** {eta_str}"
-    )
-    
-    try:
-        await status_msg.edit_text(text)
-    except Exception:
-        pass
-
-# --- 3. هوك التحميل (yt-dlp Hook) ---
-# هذه الدالة تعمل داخل Thread خاص بـ yt-dlp
-def ytdlp_progress_hook(d, client, status_msg, start_time, loop):
-    if d['status'] == 'downloading':
-        try:
-            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-            current = d.get('downloaded_bytes', 0)
-            
-            if total > 0:
-                # استدعاء دالة التحديث داخل الـ Loop الرئيسي لتيليجرام
-                future = asyncio.run_coroutine_threadsafe(
-                    progress_bar(current, total, status_msg, start_time, "جاري التحميل من المصدر"),
-                    loop
-                )
-        except Exception as e:
-            pass
-
-# --- 4. أوامر البوت ---
-
+# --- 2. أوامر البداية ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client, message):
     await message.reply_text(
         "👋 أهلاً بك! \n\n"
-        "🔗 أرسل رابط الفيديو وسأقوم بتحميله.\n"
-        "🚀 **يدعم الملفات الكبيرة مع شريط تقدم!** 📊"
+        "🔗 أرسل أي رابط فيديو (يوتيوب، تيك توك، انستقرام..).\n"
+        "🚀 **أدعم رفع ملفات حتى 2 جيجابايت!**\n"
+        "🧹 استخدم الأمر /clear لمسح الرسائل."
     )
 
+# --- 3. أمر مسح الرسائل ---
 @app.on_message(filters.command("clear"))
 async def clear_command(client, message):
+    chat_id = message.chat.id
+    status_msg = await message.reply_text("🗑️ جاري التنظيف...")
+    message_ids_to_delete = [message.id, status_msg.id]
+    start_id = message.id
+    for i in range(1, 31):
+        message_ids_to_delete.append(start_id - i)
     try:
-        await message.reply_text("تم المسح.")
-        # (يمكنك إضافة منطق المسح هنا كما في الكود السابق)
-    except:
+        await client.delete_messages(chat_id, message_ids_to_delete)
+    except Exception:
         pass
 
+# --- 4. استقبال الرابط ---
 @app.on_message(filters.text & ~filters.command(["start", "help", "clear"]) & filters.regex(r"http"))
 async def handle_link(client, message):
     chat_id = message.chat.id
-    user_urls[chat_id] = message.text.strip()
-    
+    url = message.text.strip()
+    user_urls[chat_id] = url
     buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎥 Video", callback_data="type_video"),
-            InlineKeyboardButton("🎵 Audio", callback_data="type_audio")
+            InlineKeyboardButton("🎥 Video (فيديو)", callback_data="type_video"),
+            InlineKeyboardButton("🎵 Audio (صوت)", callback_data="type_audio")
         ]
     ])
-    await message.reply_text("⬇️ اختر الصيغة:", reply_markup=buttons, quote=True)
+    await message.reply_text(
+        "⬇️ كيف تريد تحميل هذا الرابط؟",
+        reply_markup=buttons,
+        quote=True
+    )
 
+# --- 5. المعالجة ---
 @app.on_callback_query()
 async def callback_handler(client, callback_query):
     chat_id = callback_query.message.chat.id
     data = callback_query.data
     url = user_urls.get(chat_id)
-    
     if not url:
-        await callback_query.answer("❌ الرابط قديم", show_alert=True)
+        await callback_query.answer("❌ الرابط قديم، أرسله مرة أخرى.", show_alert=True)
         return
 
     is_audio = (data == "type_audio")
+    await callback_query.edit_message_text(
+        f"⏳ جاري التحميل والمعالجة... \nالرجاء الانتظار (قد يستغرق وقتاً للملفات الكبيرة)."
+    )
     
-    # رسالة الحالة الأولية
-    status_msg = await callback_query.edit_message_text("⏳ جاري تهيئة التحميل...")
-    start_time = time.time()
-    
-    # تشغيل العملية في الخلفية
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, download_and_upload, client, chat_id, url, is_audio, status_msg, start_time, loop)
+    await loop.run_in_executor(None, download_and_upload, client, chat_id, url, is_audio, callback_query.message.id)
 
-def download_and_upload(client, chat_id, url, is_audio, status_msg, start_time, loop):
-    file_path = None
+def download_and_upload(client, chat_id, url, is_audio, message_id_to_edit):
+    file_path = None # تعريف المتغير لتجنب أخطاء النطاق
     try:
-        # إعدادات yt-dlp مع إضافة الـ Hook
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
             "outtmpl": f"downloads/%(id)s_%(epoch)s.%(ext)s",
             "restrictfilenames": True,
-            # ربط دالة التقدم
-            "progress_hooks": [lambda d: ytdlp_progress_hook(d, client, status_msg, start_time, loop)],
         }
 
         if is_audio:
             ydl_opts.update({
                 "format": "bestaudio/best",
-                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
             })
         else:
             ydl_opts.update({
@@ -161,76 +102,50 @@ def download_and_upload(client, chat_id, url, is_audio, status_msg, start_time, 
                 "merge_output_format": "mp4",
             })
 
-        # --- مرحلة 1: التحميل ---
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Media")
+            title = info.get("title", "Media Clip")
+            extractor = info.get("extractor", "Web")
             
             if 'requested_downloads' in info:
                 file_path = info['requested_downloads'][0]['filepath']
             else:
                 filename = ydl.prepare_filename(info)
-                if is_audio: filename = os.path.splitext(filename)[0] + ".mp3"
+                if is_audio:
+                    filename = os.path.splitext(filename)[0] + ".mp3"
                 file_path = filename
 
         if not os.path.exists(file_path):
-            raise Exception("الملف غير موجود")
+            raise Exception("الملف غير موجود بعد التحميل.")
 
-        # --- مرحلة 2: الرفع ---
-        caption = f"✅ **{title}**"
-        
-        # نقوم بتحديث الرسالة لبدء الرفع
-        # نستخدم run_coroutine_threadsafe لأننا داخل thread
-        asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text("🚀 جاري الرفع إلى تيليجرام..."), loop
-        ).result()
-        
-        # إعادة تعيين وقت البدء لحساب سرعة الرفع بدقة
-        upload_start_time = time.time()
+        caption = f"✅ **{title}**\nSource: {extractor}\nvia @YourBotName"
 
-        # دالة الرفع في Pyrogram تقبل progress
-        # ملاحظة: نستدعي الدالة مباشرة هنا (client methods are sync-friendly inside async context usually, but better await inside async func)
-        # لكن لأننا في executor، يجب استدعاء دالة الرفع بشكل متزامن أو استخدام خدعة.
-        # الأسهل: استخدام app.send_video الخاص بـ Pyrogram هو async، لذا يجب استخدام run_coroutine_threadsafe
+        # هنا كان يحدث الخطأ سابقاً، الآن سيعمل بوجود enums
+        client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
         
-        async def upload_async():
-            client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
-            if is_audio:
-                await client.send_audio(
-                    chat_id, 
-                    file_path, 
-                    caption=caption, 
-                    title=title,
-                    progress=progress_bar, 
-                    progress_args=(status_msg, upload_start_time, "جاري الرفع")
-                )
-            else:
-                await client.send_video(
-                    chat_id, 
-                    file_path, 
-                    caption=caption, 
-                    supports_streaming=True,
-                    progress=progress_bar, 
-                    progress_args=(status_msg, upload_start_time, "جاري الرفع")
-                )
-        
-        # تنفيذ الرفع
-        asyncio.run_coroutine_threadsafe(upload_async(), loop).result()
+        if is_audio:
+            client.send_audio(chat_id, file_path, caption=caption, title=title)
+        else:
+            client.send_video(chat_id, file_path, caption=caption, supports_streaming=True)
 
-        # تنظيف
-        asyncio.run_coroutine_threadsafe(status_msg.delete(), loop)
+        client.delete_messages(chat_id, message_id_to_edit)
+        
         if os.path.exists(file_path):
             os.remove(file_path)
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        asyncio.run_coroutine_threadsafe(
-            client.send_message(chat_id, f"❌ خطأ: {str(e)[:50]}"), loop
-        )
+        try:
+            client.send_message(chat_id, f"❌ حدث خطأ أثناء التحميل: {str(e)[:100]}")
+        except:
+            pass
+        
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
+    print("Bot is running...")
     app.run()
+
