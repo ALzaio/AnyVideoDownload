@@ -2,3 +2,4 @@ pyrogram
 yt-dlp
 tgcrypto
 tqdm
+ffmpeg-python
