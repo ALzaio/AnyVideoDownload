@@ -146,7 +146,7 @@ def download_and_upload(client, chat_id, url, is_audio, message_id_to_edit):
         if not os.path.exists(file_path):
             raise Exception("الملف غير موجود بعد التحميل.")
 
-        caption = f"✅ **{title}**\nSource: {extractor}\nvia @YourBotName"
+        caption = f"✅ **{title}**\nSource: {extractor}\nvia @TikInstaDL_bot"
 
         # الرفع باستخدام Pyrogram (يدعم الملفات الكبيرة)
         client.send_chat_action(chat_id,  enums.ChatAction.UPLOAD_DOCUMENT) # إظهار "جاري الرفع.."
@@ -183,5 +183,6 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     app.run()
+
 
 
