@@ -1,2 +1,3 @@
-pyTelegramBotAPI
+pyrogram
 yt-dlp
+tgcrypto
