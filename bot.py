@@ -157,7 +157,9 @@ def download_and_upload(client, chat_id, url, is_audio, status_msg, start_time, 
             })
         else:
             ydl_opts.update({
-                "format": "bestvideo+bestaudio/best",
+                # يطلب أفضل صيغة مدمجة (V/A) أولاً، إذا لم يجدها يبحث عن أفضل صيغة منفصلة
+                # هذا يقلل من استخدام FFmpeg
+                "format": "best[ext=mp4]/bestvideo+bestaudio/best",
                 "merge_output_format": "mp4",
             })
 
@@ -234,3 +236,4 @@ if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
     app.run()
+
