@@ -10,7 +10,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# جلب التوكن
+# ================= إعدادات البوت =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
@@ -19,28 +19,29 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ================= إضافة الكوكيز =================
+# استعادة الكوكيز (مهم للمواقع المحجوبة)
 cookies_content = os.getenv("COOKIES_CONTENT")
 if cookies_content:
     try:
         with open("cookies.txt", "w") as f:
             f.write(cookies_content)
-        print("✅ تم استعادة ملف الكوكيز.")
+        print("✅ Cookies loaded.")
     except Exception as e:
-        print(f"⚠️ خطأ في الكوكيز: {e}")
+        print(f"⚠️ Cookies error: {e}")
 
+# إعداد المجلدات
 TEMP_DIR = "downloads"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# إدارة المهام
 executor = ThreadPoolExecutor(max_workers=2)
 current_tasks = {}
-pending_links = {} 
-user_mode = {} 
+pending_links = {}
 
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
 COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB
 
-# =================== Utilities ===================
+# =================== أدوات مساعدة ===================
 
 def get_output_path(extension="mp4"):
     return os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{extension}")
@@ -101,10 +102,9 @@ def progress_hook(d, chat_id, message_id, abort_flag, last_update):
             )
         except: pass
 
-# =================== دالة التحميل الذكية (Retry Logic) ===================
+# =================== منطق التحميل الذكي ===================
 
-def run_yt_dlp(ydl_opts, url):
-    """وظيفة مساعدة لتشغيل التحميل وإرجاع المسار"""
+def run_download(ydl_opts, url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info), info
@@ -113,12 +113,12 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
     output_path = get_output_path("mp3" if is_audio else "mp4")
     final_file = output_path
     
-    # الإعدادات الأساسية
+    # إعدادات عامة (مهلة طويلة لدعم SharePoint)
     base_opts = {
         "outtmpl": output_path.replace(".mp3", "") if is_audio else output_path,
         "quiet": True,
         "nocheckcertificate": True,
-        "socket_timeout": 60,
+        "socket_timeout": 60, 
         "cookiefile": "cookies.txt" if os.path.exists("cookies.txt") else None
     }
     
@@ -128,53 +128,55 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
     try:
         info = None
         
-        # === المحاولة الأولى: الإعدادات الدقيقة ===
+        # --- المحاولة الأولى: حسب طلب المستخدم ---
         try:
             ydl_opts = base_opts.copy()
             if is_audio:
                 ydl_opts["format"] = "bestaudio/best"
                 ydl_opts["postprocessors"] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
             else:
+                # محاولة تحديد الدقة
                 if quality == "best":
                     ydl_opts["format"] = "bestvideo+bestaudio/best"
                 else:
                     ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
                 ydl_opts["merge_output_format"] = "mp4"
 
-            final_file, info = run_yt_dlp(ydl_opts, url)
+            final_file, info = run_download(ydl_opts, url)
 
         except Exception as e:
-            # === المحاولة الثانية (Fallback): الوضع الخام لـ SharePoint ===
-            if abort_flag["abort"]: raise e
+            # --- المحاولة الثانية: الوضع المباشر (Fallback) ---
+            if abort_flag["abort"]: raise e # إذا المستخدم ألغى، لا نكمل
             
-            print(f"Retrying generic mode: {e}")
-            bot.edit_message_text(f"⚠️ فشلت المحاولة الأولى، جاري تجربة الطريقة المباشرة...", chat_id, message_id)
+            print(f"Fallback triggered: {e}")
+            bot.edit_message_text(f"⚠️ الرابط يتطلب تعامل خاص، جاري التحميل المباشر...", chat_id, message_id)
             
+            # إعدادات "حمل أي شيء موجود"
             ydl_opts = base_opts.copy()
-            ydl_opts["format"] = "best"
-            if not is_audio:
-                if "merge_output_format" in ydl_opts: del ydl_opts["merge_output_format"]
+            ydl_opts["format"] = "best" # أفضل ملف متاح وخلاص
+            if not is_audio and "merge_output_format" in ydl_opts:
+                 del ydl_opts["merge_output_format"]
 
-            final_file, info = run_yt_dlp(ydl_opts, url)
+            final_file, info = run_download(ydl_opts, url)
 
         if abort_flag["abort"]:
             bot.edit_message_text("❌ تم إلغاء العملية.", chat_id, message_id)
             return
 
-        # === ما بعد التحميل ===
+        # --- المعالجة بعد التحميل ---
         if is_audio:
             if not final_file.endswith(".mp3"):
                 new_path = final_file.rsplit(".", 1)[0] + ".mp3"
                 if os.path.exists(final_file):
                     shutil.move(final_file, new_path)
                     final_file = new_path
-
         elif os.path.exists(final_file):
             size = os.path.getsize(final_file)
             if size > COMPRESSION_THRESHOLD:
-                bot.edit_message_text(f"⚡ الحجم ({size//1024//1024}MB) كبير، جاري الضغط...", chat_id, message_id)
+                bot.edit_message_text(f"⚡ ضغط الملف ({size//1024//1024}MB)...", chat_id, message_id)
                 final_file = compress_video(final_file)
 
+        # --- الرفع ---
         file_size = os.path.getsize(final_file)
         if file_size > MAX_TELEGRAM_SIZE:
             bot.edit_message_text(f"❌ الملف كبير جداً ({file_size//1024//1024}MB).", chat_id, message_id)
@@ -183,19 +185,19 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
         bot.edit_message_text("⬆️ جاري الرفع...", chat_id, message_id)
         
         with open(final_file, "rb") as f:
+            caption_text = f"🎬 {info.get('title', 'Media')}\nvia AnyVideoBot"
             if is_audio:
-                bot.send_audio(chat_id, f, caption=f"🎵 {info.get('title', 'Audio')}")
+                bot.send_audio(chat_id, f, caption=caption_text)
             else:
-                caption = f"🎥 {info.get('title', 'Video')}\n⚙️ Quality: {quality}p"
-                bot.send_video(chat_id, f, caption=caption)
+                bot.send_video(chat_id, f, caption=caption_text)
 
         try: bot.delete_message(chat_id, message_id)
         except: pass
-        bot.send_message(chat_id, "✅ تم!")
+        bot.send_message(chat_id, "✅ تم التحميل!")
 
     except Exception as e:
         print(traceback.format_exc())
-        bot.edit_message_text("❌ فشل التحميل. الرابط غير مدعوم أو محمي.", chat_id, message_id)
+        bot.edit_message_text("❌ فشل التحميل. الرابط محمي أو غير صالح.", chat_id, message_id)
 
     finally:
         try:
@@ -205,136 +207,105 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
         if chat_id in current_tasks: del current_tasks[chat_id]
 
 
-# =================== 1. الأوامر الأساسية ===================
+# =================== الأوامر (Handlers) ===================
 
-@bot.message_handler(commands=["start"])
-def handle_start_mode(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    b1 = types.InlineKeyboardButton("✨ النسخة الحديثة (يوتيوب/تيك توك)", callback_data="mode_new")
-    b2 = types.InlineKeyboardButton("⚙️ النسخة القديمة (روابط مباشرة/جامعات)", callback_data="mode_old")
-    markup.add(b1, b2)
-    
-    bot.send_message(message.chat.id, 
-                     "👋 **مرحباً بك!**\nالرجاء اختيار وضع التشغيل:", 
-                     reply_markup=markup, parse_mode="Markdown")
+@bot.message_handler(commands=["start", "help"])
+def handle_start(message):
+    welcome_text = """
+👋 **أهلاً بك في بوت التحميل الشامل!**
 
-@bot.message_handler(commands=["help"])
-def handle_help(message):
-    current_mode_display = user_mode.get(message.chat.id, "لم يتم الاختيار")
-    bot.send_message(message.chat.id, f"📌 الوضع الحالي: {current_mode_display}\nالأوامر: /start, /clear, /abort, /info")
+يمكنني تحميل الفيديو والصوت من معظم المواقع (YouTube, TikTok, Instagram, Facebook) وحتى الروابط المباشرة وروابط الجامعات.
+
+📌 **الأوامر المتاحة:**
+/start - عرض هذه الرسالة
+/clear - تنظيف السيرفر (للمشرفين)
+/abort - إلغاء التحميل الحالي
+/info - معلومات عن البوت
+
+🚀 **كيف أبدأ؟**
+فقط أرسل الرابط وسأعطيك خيارات الجودة.
+    """
+    bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown")
 
 @bot.message_handler(commands=["info"])
 def handle_info(message):
-    current_mode_display = user_mode.get(message.chat.id, "لم يتم الاختيار")
-    bot.send_message(message.chat.id, f"👤 User: ziad\n⚙️ Mode: {current_mode_display}\n🛠 Ver: 3.6 (Fix Syntax)")
+    bot.reply_to(message, f"👤 UserID: {message.from_user.id}\n🤖 Version: 4.0 (Unified Smart Core)")
 
 @bot.message_handler(commands=["clear"])
 def handle_clear(message):
     clear_temp_files()
-    bot.send_message(message.chat.id, "🗑️ تم التنظيف.")
+    bot.reply_to(message, "🗑️ تم تنظيف الملفات المؤقتة.")
 
 @bot.message_handler(commands=["abort"])
 def handle_abort(message):
-    user_id = message.chat.id
-    if user_id in current_tasks:
-        current_tasks[user_id]["abort"] = True
-        bot.send_message(user_id, "⛔ جاري الإيقاف...")
+    chat_id = message.chat.id
+    if chat_id in current_tasks:
+        current_tasks[chat_id]["abort"] = True
+        bot.reply_to(message, "🛑 جاري إيقاف العملية...")
     else:
-        bot.send_message(user_id, "⚠️ لا يوجد تحميل.")
+        bot.reply_to(message, "لا يوجد تحميل حالياً.")
 
-# =================== 2. معالجة الأزرار ===================
-
-@bot.callback_query_handler(func=lambda call: call.data in ['mode_new', 'mode_old'])
-def select_mode_query(call):
-    chat_id = call.message.chat.id
-    mode = call.data.split('_')[1]
-    user_mode[chat_id] = mode
-    
-    mode_text = "الحديثة" if mode == 'new' else "القديمة (Generic)"
-    bot.edit_message_text(f"✅ تم تفعيل **النسخة {mode_text}**.", chat_id, call.message.message_id, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data in ['audio', 'video_360', 'video_720', 'video_1080'])
-def handle_new_mode_query(call):
-    chat_id = call.message.chat.id
-    if chat_id not in pending_links:
-        bot.answer_callback_query(call.id, "⚠️ الرابط منتهي.")
-        return
-
-    url = pending_links[chat_id]
-    del pending_links[chat_id]
-    
-    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-    bot.edit_message_text(f"⏳ جاري البدء...", chat_id, call.message.message_id)
-
-    is_audio = (call.data == "audio")
-    quality = "720"
-    if call.data.startswith("video_"):
-        quality = call.data.split("_")[1]
-
-    abort_flag = {"abort": False}
-    current_tasks[chat_id] = abort_flag
-    executor.submit(process_download, chat_id, call.message.message_id, url, quality, is_audio, abort_flag)
-
-@bot.callback_query_handler(func=lambda call: call.data in ['type_video', 'type_audio'])
-def handle_old_mode_query(call):
-    chat_id = call.message.chat.id
-    if chat_id not in pending_links:
-        bot.answer_callback_query(call.id, "❌ الرابط قديم.", show_alert=True)
-        return
-
-    url = pending_links[chat_id]
-    del pending_links[chat_id]
-    
-    is_audio = (call.data == "type_audio")
-    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-    bot.edit_message_text(f"⏳ جاري التحميل (Direct Mode)...", chat_id, call.message.message_id)
-
-    abort_flag = {"abort": False}
-    current_tasks[chat_id] = abort_flag
-    executor.submit(process_download, chat_id, call.message.message_id, url, "best", is_audio, abort_flag)
-
-
-# =================== 3. معالجة الروابط (نهاية الملف) ===================
+# =================== معالجة الروابط والأزرار ===================
 
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
     chat_id = message.chat.id
-    
-    if not message.text or not message.text.startswith("http"):
-        return
-    
-    if chat_id not in user_mode:
-        bot.reply_to(message, "⚠️ يرجى اختيار النسخة أولاً: /start")
+    text = message.text
+
+    if not text or not text.startswith("http"):
         return
 
     if chat_id in current_tasks:
-        bot.reply_to(message, "⚠️ انتظر انتهاء التحميل الحالي.")
+        bot.reply_to(message, "⚠️ لديك عملية جارية، انتظر انتهاءها.")
         return
 
-    url = message.text.strip()
-    pending_links[chat_id] = url
+    # حفظ الرابط وعرض الأزرار
+    pending_links[chat_id] = text.strip()
     
-    # هنا تم إصلاح الأسطر الطويلة
-    if user_mode[chat_id] == 'new':
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        b1 = types.InlineKeyboardButton("🎵 MP3", callback_data="audio")
-        b2 = types.InlineKeyboardButton("🎥 360p", callback_data="video_360")
-        b3 = types.InlineKeyboardButton("🎥 720p", callback_data="video_720")
-        b4 = types.InlineKeyboardButton("🎥 1080p", callback_data="video_1080")
-        markup.add(b1, b2, b3, b4)
-        bot.send_message(chat_id, "⬇️ اختر الجودة:", reply_markup=markup)
-        
-    elif user_mode[chat_id] == 'old':
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        b1 = types.InlineKeyboardButton("🎥 تحميل مباشر", callback_data="type_video")
-        b2 = types.InlineKeyboardButton("🎵 سحب صوت", callback_data="type_audio")
-        markup.add(b1, b2)
-        bot.send_message(chat_id, "⬇️ اختر النوع:", reply_markup=markup)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    # تعريف الأزرار بشكل منفصل لتجنب الأسطر الطويلة
+    btn_audio = types.InlineKeyboardButton("🎵 MP3 (صوت)", callback_data="audio")
+    btn_360 = types.InlineKeyboardButton("🎥 360p", callback_data="video_360")
+    btn_720 = types.InlineKeyboardButton("🎥 720p", callback_data="video_720")
+    btn_1080 = types.InlineKeyboardButton("🎥 1080p", callback_data="video_1080")
+    
+    markup.add(btn_audio)
+    markup.add(btn_360, btn_720, btn_1080)
 
+    bot.send_message(chat_id, "⬇️ اختر الجودة المطلوبة:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    chat_id = call.message.chat.id
+    data = call.data
+
+    if chat_id not in pending_links:
+        bot.answer_callback_query(call.id, "⚠️ الرابط انتهى، أرسله مجدداً.")
+        return
+
+    url = pending_links[chat_id]
+    del pending_links[chat_id]
+
+    # إخفاء الأزرار وبدء التجهيز
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    bot.edit_message_text("⏳ جاري بدء التحميل...", chat_id, call.message.message_id)
+
+    is_audio = (data == "audio")
+    quality = "best" # الافتراضي
+    
+    if data.startswith("video_"):
+        quality = data.split("_")[1]
+
+    abort_flag = {"abort": False}
+    current_tasks[chat_id] = abort_flag
+    
+    # بدء التحميل في الخلفية
+    executor.submit(process_download, chat_id, call.message.message_id, url, quality, is_audio, abort_flag)
+
+# تشغيل البوت
 if __name__ == "__main__":
-    print("🚀 Bot Started (Syntax Fixed)...")
+    print("🚀 Bot Started (Unified Edition)...")
     bot.infinity_polling()
-
 
 
 
