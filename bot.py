@@ -1,151 +1,208 @@
 import os
 import asyncio
 import logging
-from pyrogram import Client, filters, enums # ✅ تم إضافة enums هنا
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 
-# --- 1. الإعدادات والمتغيرات ---
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ====================== الإعدادات ======================
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user_urls = {}
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# --- 2. أوامر البداية ---
+# ====================== شريط التقدم ======================
+def progress_bar(current, total):
+    if total == 0:
+        return "[░░░░░░░░░░] 0.0%"
+    percentage = min(current / total, 1.0)
+    filled = int(percentage * 10)
+    return f"[{'▓' * filled}{'░' * (10 - filled)}] {percentage*100:.1f}%"
+
+def format_size(size):
+    if size < 1024**2:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024**2:.2f} MB"
+
+# ====================== الأوامر ======================
 @app.on_message(filters.command(["start", "help"]))
-async def start_command(client, message):
+async def start(client, message):
     await message.reply_text(
-        "👋 أهلاً بك! \n\n"
-        "🔗 أرسل أي رابط فيديو (يوتيوب، تيك توك، انستقرام..).\n"
-        "🚀 **أدعم رفع ملفات حتى 2 جيجابايت!**\n"
-        "🧹 استخدم الأمر /clear لمسح الرسائل."
-    )
-
-# --- 3. أمر مسح الرسائل ---
-@app.on_message(filters.command("clear"))
-async def clear_command(client, message):
-    chat_id = message.chat.id
-    status_msg = await message.reply_text("🗑️ جاري التنظيف...")
-    message_ids_to_delete = [message.id, status_msg.id]
-    start_id = message.id
-    for i in range(1, 31):
-        message_ids_to_delete.append(start_id - i)
-    try:
-        await client.delete_messages(chat_id, message_ids_to_delete)
-    except Exception:
-        pass
-
-# --- 4. استقبال الرابط ---
-@app.on_message(filters.text & ~filters.command(["start", "help", "clear"]) & filters.regex(r"http"))
-async def handle_link(client, message):
-    chat_id = message.chat.id
-    url = message.text.strip()
-    user_urls[chat_id] = url
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎥 Video (فيديو)", callback_data="type_video"),
-            InlineKeyboardButton("🎵 Audio (صوت)", callback_data="type_audio")
-        ]
-    ])
-    await message.reply_text(
-        "⬇️ كيف تريد تحميل هذا الرابط؟",
-        reply_markup=buttons,
+        "مرحباً بك في بوت التحميل!\n\n"
+        "يدعم يوتيوب • تيك توك • إنستغرام • فيسبوك وأكثر\n"
+        "حتى 2 جيجا + تقدم تحميل\n\n"
+        "أرسل أي رابط!",
         quote=True
     )
 
-# --- 5. المعالجة ---
+@app.on_message(filters.command("clear") & filters.private)
+async def clear(client, message):
+    deleted = 0
+    async for msg in client.get_chat_history(message.chat.id, limit=100):
+        if msg.from_user.is_self:
+            try:
+                await msg.delete()
+                deleted += 1
+            except:
+                pass
+    await message.reply_text(f"تم حذف {deleted} رسالة")
+
+# ====================== استقبال الرابط ======================
+@app.on_message(filters.text & filters.regex(r"https?://") & ~filters.command(["start", "help", "clear"]))
+async def get_link(client, message):
+    url = message.text.strip()
+    user_urls[message.chat.id] = url
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("فيديو", callback_data="video"),
+         InlineKeyboardButton("صوت", callback_data="audio")]
+    ])
+    await message.reply_text("اختر نوع التحميل:", reply_markup=keyboard, quote=True)
+
+# ====================== Callback ======================
 @app.on_callback_query()
-async def callback_handler(client, callback_query):
-    chat_id = callback_query.message.chat.id
-    data = callback_query.data
-    url = user_urls.get(chat_id)
+async def callback(client, cb):
+    url = user_urls.get(cb.message.chat.id)
     if not url:
-        await callback_query.answer("❌ الرابط قديم، أرسله مرة أخرى.", show_alert=True)
-        return
+        return await cb.answer("الرابط انتهى، أرسل جديد", show_alert=True)
 
-    is_audio = (data == "type_audio")
-    await callback_query.edit_message_text(
-        f"⏳ جاري التحميل والمعالجة... \nالرجاء الانتظار (قد يستغرق وقتاً للملفات الكبيرة)."
-    )
-    
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, download_and_upload, client, chat_id, url, is_audio, callback_query.message.id)
+    status_msg = await cb.message.reply_text("جاري تحليل الرابط...")
+    await cb.answer()
 
-def download_and_upload(client, chat_id, url, is_audio, message_id_to_edit):
-    file_path = None # تعريف المتغير لتجنب أخطاء النطاق
+    asyncio.create_task(download_and_upload(
+        client=client,
+        chat_id=cb.message.chat.id,
+        url=url,
+        is_audio=(cb.data == "audio"),
+        status_msg=status_msg
+    ))
+
+# ====================== التحميل والرفع (الحل النهائي) ======================
+async def download_and_upload(client, chat_id, url, is_audio, status_msg):
+    file_path = None
+    thumb_path = None
+    video_id = None
+
     try:
+        # حماية من روابط SharePoint
+        if any(d in url.lower() for d in ["sharepoint.com", "1drv.ms", "onedrive.live.com"]) and "/personal/" in url.lower():
+            await status_msg.edit_text("هذا رابط OneDrive شخصي - لا يمكن تحميله")
+            return
+
+        # إعدادات yt-dlp
         ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "outtmpl": f"downloads/%(id)s_%(epoch)s.%(ext)s",
-            "restrictfilenames": True,
+            'quiet': True,
+            'no_warnings': True,
+            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
+            'format': 'bestaudio/best' if is_audio else 'best[height<=1080]/best',
+            'merge_output_format': 'mp4' if not is_audio else None,
+            'writethumbnail': True,
+            'noplaylist': True,
+            'retries': 5,
         }
 
+        if os.path.exists('youtube_cookies.txt'):
+            ydl_opts['cookiefile'] = 'youtube_cookies.txt'
+
         if is_audio:
-            ydl_opts.update({
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            })
-        else:
-            ydl_opts.update({
-                "format": "bestvideo+bestaudio/best",
-                "merge_output_format": "mp4",
-            })
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Media Clip")
-            extractor = info.get("extractor", "Web")
-            
-            if 'requested_downloads' in info:
-                file_path = info['requested_downloads'][0]['filepath']
-            else:
-                filename = ydl.prepare_filename(info)
-                if is_audio:
-                    filename = os.path.splitext(filename)[0] + ".mp3"
-                file_path = filename
+        # استخراج المعلومات
+        await status_msg.edit_text("جاري استخراج المعلومات...")
+        info = yt_dlp.YoutubeDL(ydl_opts).extract_info(url, download=False)
+        if not info:
+            raise Exception("فشل استخراج المعلومات")
 
-        if not os.path.exists(file_path):
-            raise Exception("الملف غير موجود بعد التحميل.")
+        title = info.get('title', 'ملف وسائط')
+        video_id = info['id']
 
-        caption = f"✅ **{title}**\nSource: {extractor}\nvia @YourBotName"
+        # تحديث التقدم بـ reply بدل edit (الحل السحري)
+        last_reply = status_msg
 
-        # هنا كان يحدث الخطأ سابقاً، الآن سيعمل بوجود enums
-        client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
-        
+        def hook(d):
+            if d['status'] == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                downloaded = d.get('downloaded_bytes', 0)
+                if total > 0:
+                    perc = int(downloaded / total * 100)
+                    if perc % 10 == 0:  # كل 10%
+                        text = f"جاري التحميل...\n{progress_bar(downloaded, total)}\n{format_size(downloaded)} / {format_size(total)}"
+                        asyncio.create_task(last_reply.reply_text(text, quote=False))
+
+        ydl_opts['progress_hooks'] = [hook]
+
+        await status_msg.edit_text("بدء التحميل...")
+        yt_dlp.YoutubeDL(ydl_opts).download([url])
+
+        # البحث عن الملفات
+        import glob
+        pattern = os.path.join(DOWNLOAD_DIR, f"*{video_id}*")
+        files = glob.glob(pattern)
+        video_files = [f for f in files if f.endswith(('.mp4', '.mp3', '.mkv', '.webm', '.m4a'))]
+        thumb_files = [f for f in files if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+
+        if not video_files:
+            raise Exception("الملف لم يُحمل")
+
+        file_path = video_files[0]
+        thumb_path = thumb_files[0] if thumb_files else None
+
+        await status_msg.edit_text("جاري الرفع إلى تيليجرام...")
+
+        caption = f"**{title}**\n\n@YourBotUsername"
+
         if is_audio:
-            client.send_audio(chat_id, file_path, caption=caption, title=title)
+            await client.send_audio(
+                chat_id, file_path,
+                caption=caption,
+                thumb=thumb_path,
+                parse_mode="markdown"
+            )
         else:
-            client.send_video(chat_id, file_path, caption=caption, supports_streaming=True)
+            await client.send_video(
+                chat_id, file_path,
+                caption=caption,
+                thumb=thumb_path,
+                supports_streaming=True,
+                parse_mode="markdown"
+            )
 
-        client.delete_messages(chat_id, message_id_to_edit)
-        
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        await status_msg.edit_text("تم بنجاح!")
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        error_text = str(e)[:100]
+        if "private" in error_text.lower() or "unavailable" in error_text.lower():
+            error_text = "الفيديو خاص أو غير متاح"
         try:
-            client.send_message(chat_id, f"❌ حدث خطأ أثناء التحميل: {str(e)[:100]}")
+            await status_msg.edit_text(f"فشل التحميل:\n{error_text}")
         except:
-            pass
-        
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            await client.send_message(chat_id, f"فشل التحميل:\n{error_text}")
+        logger.error(f"Error: {e}")
 
-if __name__ == "__main__":
-    if not os.path.exists("downloads"):
-        os.makedirs("downloads")
-    print("Bot is running...")
-    app.run()
+    finally:
+        # تنظيف
+        if video_id:
+            for f in os.listdir(DOWNLOAD_DIR):
+                if video_id in f:
+                    try:
+                        os.remove(os.path.join(DOWNLOAD_DIR, f))
+                    except:
+                        pass
+
+# ====================== تشغيل ======================
+print("البوت شغال الآن - بدون أي coroutine errors!")
+app.run()
+
 
