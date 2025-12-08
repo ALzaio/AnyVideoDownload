@@ -1,5 +1,3 @@
-pyrogram
 pyTelegramBotAPI
 yt-dlp
-tgcrypto
-ffmpeg-python
+flask
