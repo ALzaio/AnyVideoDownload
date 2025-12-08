@@ -2,6 +2,7 @@
 import os
 import uuid
 import telebot
+from telebot import types
 import yt_dlp
 import traceback
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# جلب التوكن من متغيرات البيئة
+# جلب التوكن
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
@@ -18,24 +19,24 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ================= إضافة الكوكيز من Railway =================
-# هذا الجزء يأخذ النص من المتغيرات ويحوله لملف cookies.txt
+# ================= إضافة الكوكيز =================
 cookies_content = os.getenv("COOKIES_CONTENT")
 if cookies_content:
     try:
         with open("cookies.txt", "w") as f:
             f.write(cookies_content)
-        print("✅ تم استعادة ملف الكوكيز من المتغيرات بنجاح.")
+        print("✅ تم استعادة ملف الكوكيز.")
     except Exception as e:
-        print(f"⚠️ خطأ في كتابة ملف الكوكيز: {e}")
-# ==========================================================
+        print(f"⚠️ خطأ في الكوكيز: {e}")
+# ===============================================
 
 TEMP_DIR = "downloads"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# تقليل عدد العمال لتناسب السيرفر المجاني
 executor = ThreadPoolExecutor(max_workers=2)
 current_tasks = {}
+# قاموس لتخزين الرابط مؤقتاً حتى يختار المستخدم الدقة
+pending_links = {}
 
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
 COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB
@@ -46,10 +47,9 @@ def get_output_path(extension="mp4"):
     return os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{extension}")
 
 def clear_temp_files():
-    # دالة تنظيف قوية
     if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR) # يحذف المجلد بما فيه
-        os.makedirs(TEMP_DIR, exist_ok=True) # يعيد إنشاء المجلد فارغاً
+        shutil.rmtree(TEMP_DIR)
+        os.makedirs(TEMP_DIR, exist_ok=True)
 
 def compress_video(input_path):
     size = os.path.getsize(input_path)
@@ -57,20 +57,18 @@ def compress_video(input_path):
         return input_path
 
     output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
-    # محاولة العثور على ffmpeg
     ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
-    # إعدادات ضغط متوسطة لتناسب السيرفرات الضعيفة
     cmd = [
         ffmpeg_path, "-i", input_path,
-        "-vcodec", "libx264", "-preset", "ultrafast", # ultrafast لتقليل استهلاك المعالج
-        "-crf", "30", "-acodec", "aac", "-b:a", "128k",
+        "-vcodec", "libx264", "-preset", "ultrafast",
+        "-crf", "32", "-acodec", "aac", "-b:a", "128k",
         output_path
     ]
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300) # مهلة 5 دقائق
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=400)
     except subprocess.TimeoutExpired:
-        return input_path # إذا تأخر الضغط، أعد الملف الأصلي
+        return input_path
 
     if os.path.exists(output_path) and os.path.getsize(output_path) < size:
         return output_path
@@ -83,14 +81,13 @@ def make_bar(percent):
     empty = 20 - filled
     return f"[{'█'*filled}{'░'*empty}] {percent:.1f}%"
 
-def progress_hook(d, progress_msg, abort_flag, last_update):
+def progress_hook(d, chat_id, message_id, abort_flag, last_update):
     if abort_flag["abort"]:
-        raise yt_dlp.utils.DownloadError("تم إلغاء التحميل من قبل المستخدم")
+        raise yt_dlp.utils.DownloadError("Cancelled")
 
     if d["status"] == "downloading":
         now = time.time()
-        # تحديث الرسالة كل 3 ثواني لتجنب الحظر من تيليجرام (Flood Wait)
-        if now - last_update[0] < 3:
+        if now - last_update[0] < 4: # تحديث كل 4 ثواني
             return
         last_update[0] = now
         
@@ -101,166 +98,166 @@ def progress_hook(d, progress_msg, abort_flag, last_update):
         
         try:
             bot.edit_message_text(
-                chat_id=progress_msg.chat.id, 
-                message_id=progress_msg.message_id,
+                chat_id=chat_id, 
+                message_id=message_id,
                 text=f"⏳ جاري التحميل...\n{bar}\n{downloaded//1024} KB / {total//1024} KB"
             )
-        except Exception: 
-            pass
+        except: pass
 
-# =================== Core Processing ===================
+# =================== Core Logic ===================
 
-def process_message(message, abort_flag):
-    user_id = message.chat.id
-    url = message.text.strip()
-    
-    # رسالة أولية
-    try:
-        progress_msg = bot.send_message(user_id, "🔍 جاري فحص الرابط...")
-    except:
-        return # إذا لم يستطع البوت الإرسال (حظر مثلاً)
-
-    output_path = get_output_path("mp4")
+def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
+    output_path = get_output_path("mp3" if is_audio else "mp4")
     
     # إعدادات yt-dlp
     ydl_opts = {
-        "outtmpl": output_path,
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]", # تحديد الدقة بـ 720 لضمان السرعة
-        "merge_output_format": "mp4",
+        "outtmpl": output_path.replace(".mp3", "") if is_audio else output_path, # mp3 extension added by postprocessor
         "quiet": True,
         "nocheckcertificate": True,
         "socket_timeout": 15
     }
-    
-    # استخدام ملف الكوكيز إذا وجد
+
+    if is_audio:
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+    else:
+        # اختيار الدقة المطلوبة
+        if quality == "best":
+            ydl_opts["format"] = "bestvideo+bestaudio/best"
+        else:
+            ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
+        ydl_opts["merge_output_format"] = "mp4"
+
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
 
     last_update = [0]
-    ydl_opts["progress_hooks"] = [lambda d: progress_hook(d, progress_msg, abort_flag, last_update)]
+    ydl_opts["progress_hooks"] = [lambda d: progress_hook(d, chat_id, message_id, abort_flag, last_update)]
 
     final_file = output_path
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+            # التأكد من اسم الملف النهائي (خاصة مع mp3 قد يتغير الامتداد)
+            if is_audio:
+                final_file = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
+            else:
                 final_file = ydl.prepare_filename(info)
-            except Exception as e:
-                bot.edit_message_text("❌ الرابط غير صالح أو الموقع غير مدعوم.", user_id, progress_msg.message_id)
-                return
 
         if abort_flag["abort"]:
-            bot.send_message(user_id, "❌ تم إلغاء التحميل.")
+            bot.edit_message_text("❌ تم إلغاء العملية.", chat_id, message_id)
             return
 
-        # التحقق من الحجم والضغط
-        if os.path.exists(final_file):
-            file_size = os.path.getsize(final_file)
-            
-            if file_size > COMPRESSION_THRESHOLD:
-                bot.edit_message_text("⚡ الحجم كبير، جاري الضغط...", user_id, progress_msg.message_id)
+        # معالجة الفيديو (فقط إذا لم يكن صوت)
+        if not is_audio and os.path.exists(final_file):
+            size = os.path.getsize(final_file)
+            if size > COMPRESSION_THRESHOLD:
+                bot.edit_message_text(f"⚡ الحجم ({size//1024//1024}MB) كبير، جاري الضغط...", chat_id, message_id)
                 final_file = compress_video(final_file)
-            
-            file_size = os.path.getsize(final_file)
-            if file_size > MAX_TELEGRAM_SIZE:
-                bot.send_message(user_id, f"❌ الملف كبير جداً ({file_size//1024//1024}MB) ولا يمكن رفعه.")
-                return
 
-            bot.edit_message_text("⬆️ جاري الرفع...", user_id, progress_msg.message_id)
-            
-            with open(final_file, "rb") as f:
-                bot.send_video(user_id, f, caption=f"🎥 {info.get('title', 'Video')}")
-            
-            # حذف رسالة الانتظار
-            try: bot.delete_message(user_id, progress_msg.message_id)
-            except: pass
-            
-            bot.send_message(user_id, "✅ تم التحميل بنجاح!")
+        # الرفع
+        file_size = os.path.getsize(final_file)
+        if file_size > MAX_TELEGRAM_SIZE:
+            bot.edit_message_text(f"❌ الملف كبير جداً ({file_size//1024//1024}MB).", chat_id, message_id)
+            return
+
+        bot.edit_message_text("⬆️ جاري الرفع إلى تيليجرام...", chat_id, message_id)
+        
+        with open(final_file, "rb") as f:
+            if is_audio:
+                bot.send_audio(chat_id, f, caption=f"🎵 {info.get('title', 'Audio')}\n👤 {info.get('uploader', 'Unknown')}")
+            else:
+                bot.send_video(chat_id, f, caption=f"🎥 {info.get('title', 'Video')}\n⚙️ Quality: {quality}p")
+
+        # حذف رسالة الانتظار
+        try: bot.delete_message(chat_id, message_id)
+        except: pass
+        bot.send_message(chat_id, "✅ تم!")
 
     except Exception as e:
         print(traceback.format_exc())
-        bot.send_message(user_id, "❌ حدث خطأ غير متوقع.")
-    
-    finally:
-        # تنظيف الملف الحالي
-        if os.path.exists(output_path): 
-            try: os.remove(output_path) 
-            except: pass
-        if os.path.exists(final_file) and final_file != output_path:
-            try: os.remove(final_file)
-            except: pass
-            
-        if user_id in current_tasks:
-            del current_tasks[user_id]
+        bot.edit_message_text("❌ فشل التحميل. تأكد أن الرابط صالح.", chat_id, message_id)
 
-# =================== Bot Handlers (الأوامر) ===================
+    finally:
+        # تنظيف
+        try:
+            if os.path.exists(final_file): os.remove(final_file)
+            if os.path.exists(output_path) and output_path != final_file: os.remove(output_path)
+        except: pass
+        if chat_id in current_tasks: del current_tasks[chat_id]
+
+# =================== Handlers ===================
 
 @bot.message_handler(commands=["start", "help"])
 def handle_help(message):
-    help_text = """
-👋 **مرحباً بك في بوت التحميل!**
-
-📌 **الأوامر المتاحة:**
-/start  - إظهار هذه القائمة
-/info   - معلومات المستخدم والمطور
-/clear  - تنظيف الملفات المؤقتة من السيرفر
-/abort  - إلغاء عملية التحميل الحالية
-
-🔗 **كيفية الاستخدام:**
-فقط أرسل رابط الفيديو (يوتيوب، تيك توك، فيسبوك...) وسيبدأ التحميل فوراً.
-    """
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
+    bot.reply_to(message, "👋 أهلاً!\nأرسل رابط فيديو وسأعطيك خيارات التحميل (فيديو أو صوت).")
 
 @bot.message_handler(commands=["info"])
 def handle_info(message):
-    # تم إضافة اسمك ziad كما طلبت
-    info_text = f"""
-👤 **معلومات المستخدم:**
-الاسم: ziad
-ID: {message.from_user.id}
-
-🛠 **معلومات البوت:**
-النسخة: 2.0 (Railway Edition)
-المطور: ALzaio
-    """
-    bot.send_message(message.chat.id, info_text)
+    bot.reply_to(message, f"👤 User: ziad\n🆔 ID: {message.from_user.id}\n🤖 Bot: v2.5 (Quality Selector)")
 
 @bot.message_handler(commands=["clear"])
 def handle_clear(message):
-    # التأكد أن المستخدم هو المشرف (اختياري، هنا متاح للجميع للتجربة)
     clear_temp_files()
-    bot.send_message(message.chat.id, "🗑️ **تم مسح جميع الملفات المؤقتة من السيرفر بنجاح.**", parse_mode="Markdown")
-
-@bot.message_handler(commands=["abort"])
-def handle_abort(message):
-    user_id = message.chat.id
-    if user_id in current_tasks:
-        current_tasks[user_id]["abort"] = True
-        bot.send_message(user_id, "⛔ تم إرسال أمر الإيقاف، يرجى الانتظار...")
-    else:
-        bot.send_message(user_id, "⚠️ لا يوجد تحميل جاري حالياً.")
+    bot.reply_to(message, "🗑️ تم تنظيف السيرفر.")
 
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
-    # التحقق من أن الرسالة تحتوي على رابط
     if not message.text.startswith("http"):
-        bot.reply_to(message, "⚠️ الرجاء إرسال رابط صحيح يبدأ بـ http")
+        bot.reply_to(message, "⚠️ أرسل رابطاً صحيحاً.")
         return
 
-    if message.chat.id in current_tasks:
-        bot.reply_to(message, "⚠️ لديك عملية تحميل جارية بالفعل. انتظر انتهاءها أو استخدم /abort")
+    # حفظ الرابط مؤقتاً
+    pending_links[message.chat.id] = message.text.strip()
+
+    # إنشاء لوحة الأزرار
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btn_audio = types.InlineKeyboardButton("🎵 MP3 (صوت)", callback_data="audio")
+    btn_360 = types.InlineKeyboardButton("🎥 360p", callback_data="video_360")
+    btn_720 = types.InlineKeyboardButton("🎥 720p", callback_data="video_720")
+    btn_1080 = types.InlineKeyboardButton("🎥 1080p", callback_data="video_1080")
+    
+    markup.add(btn_audio)
+    markup.add(btn_360, btn_720, btn_1080)
+
+    bot.send_message(message.chat.id, "⬇️ اختر الجودة المطلوبة:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    chat_id = call.message.chat.id
+    
+    if chat_id not in pending_links:
+        bot.answer_callback_query(call.id, "⚠️ الرابط انتهت صلاحيته، أرسله مجدداً.")
         return
+
+    url = pending_links[chat_id]
+    del pending_links[chat_id] # حذف الرابط بعد الاستخدام
+    
+    # إخفاء الأزرار
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    bot.edit_message_text(f"⏳ تم اختيار {call.data}. جاري البدء...", chat_id, call.message.message_id)
+
+    # تحديد الإعدادات
+    is_audio = False
+    quality = "720"
+
+    if call.data == "audio":
+        is_audio = True
+    elif call.data.startswith("video_"):
+        quality = call.data.split("_")[1]
 
     abort_flag = {"abort": False}
-    current_tasks[message.chat.id] = abort_flag
+    current_tasks[chat_id] = abort_flag
     
-    # بدء المعالجة في خيط منفصل
-    executor.submit(process_message, message, abort_flag)
+    executor.submit(process_download, chat_id, call.message.message_id, url, quality, is_audio, abort_flag)
 
-# تشغيل البوت
 if __name__ == "__main__":
-    print("🚀 البوت يعمل الآن (Ziad Edition)...")
+    print("🚀 Bot Started (Quality Select Edition)...")
     bot.infinity_polling()
 
 
