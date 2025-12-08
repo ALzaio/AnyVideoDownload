@@ -118,7 +118,7 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
         "outtmpl": output_path.replace(".mp3", "") if is_audio else output_path,
         "quiet": True,
         "nocheckcertificate": True,
-        "socket_timeout": 60, # ✅ تم رفع المهلة لـ 60 ثانية لدعم SharePoint
+        "socket_timeout": 60,
         "cookiefile": "cookies.txt" if os.path.exists("cookies.txt") else None
     }
     
@@ -145,31 +145,24 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
 
         except Exception as e:
             # === المحاولة الثانية (Fallback): الوضع الخام لـ SharePoint ===
-            if abort_flag["abort"]: raise e # إذا كان الإلغاء من المستخدم لا نحاول مرة أخرى
+            if abort_flag["abort"]: raise e
             
-            print(f"⚠️ First attempt failed: {e}. Retrying with generic settings...")
-            bot.edit_message_text(f"⚠️ فشلت المحاولة الأولى، جاري تجربة الطريقة المباشرة (Generic Mode)...", chat_id, message_id)
+            print(f"Retrying generic mode: {e}")
+            bot.edit_message_text(f"⚠️ فشلت المحاولة الأولى، جاري تجربة الطريقة المباشرة...", chat_id, message_id)
             
-            # إعدادات بسيطة جداً للمواقع المعقدة
             ydl_opts = base_opts.copy()
-            ydl_opts["format"] = "best" # أفضل ملف متاح بدون دمج
+            ydl_opts["format"] = "best"
             if not is_audio:
-                del ydl_opts["merge_output_format"] # حذف شرط الدمج
+                if "merge_output_format" in ydl_opts: del ydl_opts["merge_output_format"]
 
             final_file, info = run_yt_dlp(ydl_opts, url)
-            
-            # تصحيح الاسم إذا تغير الامتداد
-            if is_audio and not final_file.endswith(".mp3"):
-                # تحويل يدوي إذا فشل التحويل التلقائي
-                pass 
 
         if abort_flag["abort"]:
             bot.edit_message_text("❌ تم إلغاء العملية.", chat_id, message_id)
             return
 
-        # === ما بعد التحميل (الضغط والرفع) ===
+        # === ما بعد التحميل ===
         if is_audio:
-            # التأكد من أن الملف ينتهي بـ mp3
             if not final_file.endswith(".mp3"):
                 new_path = final_file.rsplit(".", 1)[0] + ".mp3"
                 if os.path.exists(final_file):
@@ -187,15 +180,14 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
             bot.edit_message_text(f"❌ الملف كبير جداً ({file_size//1024//1024}MB).", chat_id, message_id)
             return
 
-        bot.edit_message_text("⬆️ جاري الرفع إلى تيليجرام...", chat_id, message_id)
+        bot.edit_message_text("⬆️ جاري الرفع...", chat_id, message_id)
         
         with open(final_file, "rb") as f:
             if is_audio:
                 bot.send_audio(chat_id, f, caption=f"🎵 {info.get('title', 'Audio')}")
             else:
-                caption_text = f"🎥 {info.get('title', 'Video')}\n"
-                caption_text += f"⚙️ Quality: {quality}p" if quality != "best" else "⚙️ Quality: Best Available"
-                bot.send_video(chat_id, f, caption=caption_text)
+                caption = f"🎥 {info.get('title', 'Video')}\n⚙️ Quality: {quality}p"
+                bot.send_video(chat_id, f, caption=caption)
 
         try: bot.delete_message(chat_id, message_id)
         except: pass
@@ -218,50 +210,28 @@ def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
 @bot.message_handler(commands=["start"])
 def handle_start_mode(message):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    btn_new = types.InlineKeyboardButton("✨ النسخة الحديثة (يوتيوب/تيك توك)", callback_data="mode_new")
-    btn_old = types.InlineKeyboardButton("⚙️ النسخة القديمة (روابط مباشرة/جامعات)", callback_data="mode_old")
-    markup.add(btn_new, btn_old)
+    b1 = types.InlineKeyboardButton("✨ النسخة الحديثة (يوتيوب/تيك توك)", callback_data="mode_new")
+    b2 = types.InlineKeyboardButton("⚙️ النسخة القديمة (روابط مباشرة/جامعات)", callback_data="mode_old")
+    markup.add(b1, b2)
     
     bot.send_message(message.chat.id, 
-                     "👋 **مرحباً بك!**\nالرجاء اختيار وضع التشغيل:\n\n"
-                     "• **الحديثة:** للمواقع المشهورة مع خيارات جودة.\n"
-                     "• **القديمة:** للروابط المباشرة و SharePoint.", 
+                     "👋 **مرحباً بك!**\nالرجاء اختيار وضع التشغيل:", 
                      reply_markup=markup, parse_mode="Markdown")
 
 @bot.message_handler(commands=["help"])
 def handle_help(message):
     current_mode_display = user_mode.get(message.chat.id, "لم يتم الاختيار")
-    help_text = f"""
-👋 **مرحباً بك في بوت التحميل!**
-*الوضع الحالي: {current_mode_display}*
-
-📌 **الأوامر:**
-/start  - تغيير الوضع
-/info   - معلومات البوت
-/clear  - تنظيف السيرفر
-/abort  - إلغاء التحميل
-"""
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
+    bot.send_message(message.chat.id, f"📌 الوضع الحالي: {current_mode_display}\nالأوامر: /start, /clear, /abort, /info")
 
 @bot.message_handler(commands=["info"])
 def handle_info(message):
     current_mode_display = user_mode.get(message.chat.id, "لم يتم الاختيار")
-    info_text = f"""
-👤 **معلومات المستخدم:**
-الاسم: ziad
-ID: {message.from_user.id}
-الوضع المختار: {current_mode_display}
-
-🛠 **معلومات البوت:**
-النسخة: 3.5 (SharePoint Support)
-المطور: ALzaio
-    """
-    bot.send_message(message.chat.id, info_text)
+    bot.send_message(message.chat.id, f"👤 User: ziad\n⚙️ Mode: {current_mode_display}\n🛠 Ver: 3.6 (Fix Syntax)")
 
 @bot.message_handler(commands=["clear"])
 def handle_clear(message):
     clear_temp_files()
-    bot.send_message(message.chat.id, "🗑️ **تم التنظيف بنجاح.**", parse_mode="Markdown")
+    bot.send_message(message.chat.id, "🗑️ تم التنظيف.")
 
 @bot.message_handler(commands=["abort"])
 def handle_abort(message):
@@ -281,8 +251,7 @@ def select_mode_query(call):
     user_mode[chat_id] = mode
     
     mode_text = "الحديثة" if mode == 'new' else "القديمة (Generic)"
-    bot.edit_message_text(f"✅ تم تفعيل **النسخة {mode_text}**.",
-                          chat_id, call.message.message_id, parse_mode="Markdown")
+    bot.edit_message_text(f"✅ تم تفعيل **النسخة {mode_text}**.", chat_id, call.message.message_id, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data in ['audio', 'video_360', 'video_720', 'video_1080'])
 def handle_new_mode_query(call):
@@ -325,7 +294,7 @@ def handle_old_mode_query(call):
     executor.submit(process_download, chat_id, call.message.message_id, url, "best", is_audio, abort_flag)
 
 
-# =================== 3. معالجة الروابط ===================
+# =================== 3. معالجة الروابط (نهاية الملف) ===================
 
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
@@ -345,10 +314,26 @@ def handle_message(message):
     url = message.text.strip()
     pending_links[chat_id] = url
     
+    # هنا تم إصلاح الأسطر الطويلة
     if user_mode[chat_id] == 'new':
         markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(types.InlineKeyboardButton("🎵 MP3", callback_data="audio"),
-                   types.InlineKeyboardButton("🎥 360p", callback_data="video_3
+        b1 = types.InlineKeyboardButton("🎵 MP3", callback_data="audio")
+        b2 = types.InlineKeyboardButton("🎥 360p", callback_data="video_360")
+        b3 = types.InlineKeyboardButton("🎥 720p", callback_data="video_720")
+        b4 = types.InlineKeyboardButton("🎥 1080p", callback_data="video_1080")
+        markup.add(b1, b2, b3, b4)
+        bot.send_message(chat_id, "⬇️ اختر الجودة:", reply_markup=markup)
+        
+    elif user_mode[chat_id] == 'old':
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        b1 = types.InlineKeyboardButton("🎥 تحميل مباشر", callback_data="type_video")
+        b2 = types.InlineKeyboardButton("🎵 سحب صوت", callback_data="type_audio")
+        markup.add(b1, b2)
+        bot.send_message(chat_id, "⬇️ اختر النوع:", reply_markup=markup)
+
+if __name__ == "__main__":
+    print("🚀 Bot Started (Syntax Fixed)...")
+    bot.infinity_polling()
 
 
 
