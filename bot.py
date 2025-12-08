@@ -18,6 +18,18 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ================= إضافة الكوكيز من Railway =================
+# هذا الجزء يأخذ النص من المتغيرات ويحوله لملف cookies.txt
+cookies_content = os.getenv("COOKIES_CONTENT")
+if cookies_content:
+    try:
+        with open("cookies.txt", "w") as f:
+            f.write(cookies_content)
+        print("✅ تم استعادة ملف الكوكيز من المتغيرات بنجاح.")
+    except Exception as e:
+        print(f"⚠️ خطأ في كتابة ملف الكوكيز: {e}")
+# ==========================================================
+
 TEMP_DIR = "downloads"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -120,7 +132,7 @@ def process_message(message, abort_flag):
         "socket_timeout": 15
     }
     
-    # استخدام ملف الكوكيز إذا وجد (يفضل عدم استخدامه في بيئة عامة)
+    # استخدام ملف الكوكيز إذا وجد
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
 
