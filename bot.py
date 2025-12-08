@@ -6,8 +6,9 @@ import yt_dlp
 import traceback
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -34,7 +35,7 @@ def clear_temp_files():
 def compress_video(input_path):
     size = os.path.getsize(input_path)
     if size <= COMPRESSION_THRESHOLD:
-        return input_path  # لا حاجة للضغط
+        return input_path
 
     output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
     ffmpeg_path = shutil.which("ffmpeg") or "/usr/local/bin/ffmpeg"
@@ -58,12 +59,16 @@ def make_bar(percent):
     empty = 20 - filled
     return f"[{'█'*filled}{'░'*empty}] {percent:.1f}%"
 
-def progress_hook(d, progress_msg, abort_flag):
+def progress_hook(d, progress_msg, abort_flag, last_update):
     if abort_flag["abort"]:
         raise yt_dlp.utils.DownloadError("تم إلغاء التحميل من قبل المستخدم")
 
     if d["status"] == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+        now = time.time()
+        if now - last_update[0] < 1:  # تحديث كل ثانية فقط
+            return
+        last_update[0] = now
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 4
         downloaded = d.get("downloaded_bytes", 0)
         percent = downloaded * 100 / total
         bar = make_bar(percent)
@@ -74,7 +79,7 @@ def progress_hook(d, progress_msg, abort_flag):
 
 # =================== Processing ===================
 
-def process_message(message, abort_flag):
+def process_message(message, abort_flag, quality="best", audio_only=False):
     user_id = message.chat.id
     url = message.text.strip()
 
@@ -82,19 +87,28 @@ def process_message(message, abort_flag):
     output_path = get_output_path("mp4")
     cookie_file = "cookies.txt"
 
+    ydl_format = {
+        "best": "bestvideo+bestaudio/best",
+        "1080": "bestvideo[height<=1080]+bestaudio/best",
+        "720": "bestvideo[height<=720]+bestaudio/best",
+        "480": "bestvideo[height<=480]+bestaudio/best"
+    }.get(quality, "bestvideo+bestaudio/best")
+
     ydl_opts = {
         "outtmpl": output_path,
-        "format": "bestvideo+bestaudio/best",
+        "format": "bestaudio/best" if audio_only else ydl_format,
         "merge_output_format": "mp4",
         "quiet": True,
         "nocheckcertificate": True,
         "socket_timeout": 20,
         "retries": 3,
-        "progress_hooks": [lambda d: progress_hook(d, progress_msg, abort_flag)]
     }
 
     if os.path.exists(cookie_file):
         ydl_opts["cookiefile"] = cookie_file
+
+    last_update = [0]
+    ydl_opts["progress_hooks"] = [lambda d: progress_hook(d, progress_msg, abort_flag, last_update)]
 
     file_name = output_path
     try:
@@ -108,8 +122,7 @@ def process_message(message, abort_flag):
             bot.send_message(user_id, "❌ تم إلغاء التحميل.")
             return
 
-        # ضغط الفيديو إذا كان كبير
-        if os.path.getsize(file_name) > COMPRESSION_THRESHOLD:
+        if not audio_only and os.path.getsize(file_name) > COMPRESSION_THRESHOLD:
             bot.edit_message_text(user_id, progress_msg.message_id, "⚡ جاري ضغط الفيديو لتقليل الحجم...")
             file_name = compress_video(file_name)
 
@@ -117,16 +130,18 @@ def process_message(message, abort_flag):
             bot.send_message(user_id, "❌ تم إلغاء العملية أثناء الضغط.")
             return
 
-        # فحص حجم الفيديو للرفع على Telegram
         file_size = os.path.getsize(file_name)
         if file_size > MAX_TELEGRAM_SIZE:
             bot.send_message(user_id, f"❌ حجم الملف كبير جدًا ({file_size//1024//1024}MB) ولا يمكن رفعه.")
             return
 
         with open(file_name, "rb") as f:
-            bot.send_video(user_id, f)
+            if audio_only:
+                bot.send_audio(user_id, f)
+            else:
+                bot.send_video(user_id, f)
 
-        bot.send_message(user_id, "✅ تم رفع الفيديو بنجاح!")
+        bot.send_message(user_id, "✅ تم رفع الملف بنجاح!")
 
     except Exception:
         print(traceback.format_exc())
@@ -136,7 +151,6 @@ def process_message(message, abort_flag):
             if os.path.exists(f):
                 try: os.remove(f)
                 except: pass
-        # إزالة المهمة من القائمة
         if user_id in current_tasks:
             del current_tasks[user_id]
 
@@ -160,10 +174,12 @@ def handle_abort(message):
 def handle_message(message):
     abort_flag = {"abort": False}
     current_tasks[message.chat.id] = abort_flag
-    executor.submit(process_message, message, abort_flag)
+    # مثال: تحميل فيديو 720p بدون صوت فقط
+    executor.submit(process_message, message, abort_flag, quality="720", audio_only=False)
 
 print("🚀 البوت يعمل الآن...")
 bot.infinity_polling()
+
 
 
 
