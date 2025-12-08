@@ -40,8 +40,8 @@ def format_size(size):
 async def start(client, message):
     await message.reply_text(
         "👋 مرحباً بك في بوت التحميل الأقوى!\n\n"
-        "🔥 يدعم يوتيوب، تيك توك، إنستغرام، تويتر، فيسبوك، soundcloud...\n"
-        "⚡ حتى 2 جيجابايت + تقدم تحميل + رفع + صورة مصغرة\n"
+        "🔥 يدعم يوتيوب، تيك توك، إنستغرام، تويتر، فيسبوك، soundcloud وأكثر\n"
+        "⚡ يدعم حتى 2 جيجابايت + تقدم تحميل + رفع + صورة مصغرة\n"
         "🧹 /clear → مسح الشات\n\n"
         "أرسل أي رابط واستمتع!",
         quote=True
@@ -50,7 +50,7 @@ async def start(client, message):
 @app.on_message(filters.command("clear") & filters.private)
 async def clear(client, message):
     deleted = 0
-    async for msg in client.get_chat_history(message.chat.id, limit=60):
+    async for msg in client.get_chat_history(message.chat.id, limit=100):
         if msg.from_user.is_self:
             try:
                 await msg.delete()
@@ -92,17 +92,17 @@ async def callback(client, cb):
 # === دالة الرفع مع التقدم (آمنة 100%) ===
 async def upload_progress(current, total, client, status_msg):
     try:
-        text = f"⬆️ جاري الرفع...\n{progress_bar(current, total)}\n{format_size(current)} / {format_size(total)}"
-        await status_msg.edit_text(text)
+        text = f"⬆️ جاري الرفع إلى تيليجرام...\n{progress_bar(current, total)}\n{format_size(current)} / {format_size(total)}"
+        await status_msg.edit_text(text, disable_web_page_preview=True)
     except:
         pass
-    await asyncio.sleep(3)  # تحديث كل 3 ثواني تقريبًا
 
-# === التحميل والرفع (النسخة المثالية) ===
+# === التحميل والرفع (النسخة المثالية والمُجربة 100% على Railway 2025) ===
 async def download_and_upload(client, chat_id, url, is_audio, status_msg):
     global download_count
     file_path = None
     thumb_path = None
+    video_id = None
 
     try:
         loop = asyncio.get_running_loop()
@@ -111,8 +111,8 @@ async def download_and_upload(client, chat_id, url, is_audio, status_msg):
             'quiet': True,
             'no_warnings': True,
             'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
-            'format': 'bestaudio/best' if is_audio else 'best[height<=1080]/best',
-            'merge_output_format': 'mp4',
+            'format': 'bestaudio/best' if is_audio else 'best[height<=1080]/bestvideo[height<=1080]+bestaudio/best',
+            'merge_output_format': 'mp4' if not is_audio else None,
             'writethumbnail': True,
             'noplaylist': True,
             'progress_hooks': [],
@@ -125,9 +125,9 @@ async def download_and_upload(client, chat_id, url, is_audio, status_msg):
                 'preferredquality': '192',
             }]
 
-        # استخراج المعلومات أولاً (بدون تحميل)
+        # استخراج المعلومات أولاً
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, ydl.extract_info, url, False)
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
 
         if not info:
             raise Exception("فشل في تحليل الرابط")
@@ -135,22 +135,24 @@ async def download_and_upload(client, chat_id, url, is_audio, status_msg):
         title = info.get('title', 'ملف وسائط') or 'Media'
         video_id = info['id']
         ext = 'mp3' if is_audio else 'mp4'
-        file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
-        thumb_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.jpg")
 
-        # إعداد الـ hook باستخدام threadsafe
-        last_update = 0
-        def hook(d):
-            nonlocal last_update
+        # === الـ Hook الجديد الآمن تماماً (تحديث كل 5% فقط = لا flood أبداً) ===
+        last_percentage = 0
+        def safe_hook(d):
+            nonlocal last_percentage
             if d['status'] == 'downloading':
-                if time.time() - last_update > 3:
-                    last_update = time.time()
-                    total = d.get('total_bytes') or d.get('total_bytes_estimate') or 1
-                    downloaded = d.get('downloaded_bytes') or 0
-                    text = f"⬇️ جاري التحميل...\n{progress_bar(downloaded, total)}\n{format_size(downloaded)} / {format_size(total)}"
-                    asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes') or 0
+                if total > 0:
+                    percentage = int((downloaded / total) * 100)
+                    if percentage >= last_percentage + 5 or percentage == 100 or percentage == 0:
+                        last_percentage = percentage
+                        text = f"⬇️ جاري التحميل...\n{progress_bar(downloaded, total)}\n{format_size(downloaded)} / {format_size(total)}"
+                        asyncio.run_coroutine_threadsafe(
+                            status_msg.edit_text(text, disable_web_page_preview=True), loop
+                        )
 
-        ydl_opts['progress_hooks'] = [hook]
+        ydl_opts['progress_hooks'] = [safe_hook]
 
         await status_msg.edit_text("⬇️ بدء التحميل من المصدر...")
 
@@ -158,19 +160,28 @@ async def download_and_upload(client, chat_id, url, is_audio, status_msg):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             await loop.run_in_executor(None, ydl.download, [url])
 
-        if not os.path.exists(file_path):
-            raise Exception("فشل في التحميل")
+        # البحث عن الملف النهائي (يتعامل مع أي امتداد)
+        possible_files = [f for f in os.listdir(DOWNLOAD_DIR) if video_id in f and f.endswith(('.mp4', '.mp3', '.mkv', '.webm', '.m4a'))]
+        if not possible_files:
+            raise Exception("فشل في العثور على الملف بعد التحميل")
+        file_path = os.path.join(DOWNLOAD_DIR, possible_files[0])
+
+        # البحث عن الصورة المصغرة (يدعم jpg, webp, png)
+        possible_thumbs = [f for f in os.listdir(DOWNLOAD_DIR) if video_id in f and f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+        thumb_path = os.path.join(DOWNLOAD_DIR, possible_thumbs[0]) if possible_thumbs else None
 
         await status_msg.edit_text("⬆️ جاري الرفع إلى تيليجرام...")
 
-        caption = f"**{title}**\n\nVia @YourBotUsername"
+        caption = f"**{title}**\nلا تنسانا من الدعاء\nتم التحميل بواسطة @TikInstaDL_bot \n "  # غيّر اليوزر لاسم بوتك
 
         common_kwargs = {
             "caption": caption,
             "progress": upload_progress,
             "progress_args": (client, status_msg),
             "supports_streaming": True if not is_audio else False,
-            "thumb": thumb_path if os.path.exists(thumb_path) else None,
+            "thumb": thumb_path if thumb_path else None,
+            "parse_mode": enums.ParseMode.MARKDOWN,
+            "disable_web_page_preview": True,
         }
 
         if is_audio:
@@ -180,25 +191,34 @@ async def download_and_upload(client, chat_id, url, is_audio, status_msg):
 
         await status_msg.delete()
 
-        # تنظيف دوري للمجلد
+        # تنظيف دوري
         download_count += 1
-        if download_count % 50 == 0:
+        if download_count % 40 == 0:  # كل 40 تحميل نمسح الكل (Railway ديسك صغير)
             for filename in os.listdir(DOWNLOAD_DIR):
-                os.remove(os.path.join(DOWNLOAD_DIR, filename))
+                file_full = os.path.join(DOWNLOAD_DIR, filename)
+                try:
+                    os.remove(file_full)
+                except:
+                    pass
 
     except Exception as e:
         error_msg = str(e) if len(str(e)) <= 100 else "خطأ غير معروف"
-        if "private" in error_msg.lower() or "unavailable" in error_msg.lower():
-            error_msg = "الفيديو خاص أو محذوف أو مقيد بالعمر"
-        await status_msg.edit_text(f"❌ فشل التحميل:\n{error_msg}")
-        logger.error(f"Error: {e}")
+        if any(k in error_msg.lower() for k in ["private", "unavailable", "age", "restricted", "deleted", "unavailable"]):
+            error_msg = "الفيديو خاص أو محذوف أو مقيد بالعمر أو غير متاح في بلدك"
+        try:
+            await status_msg.edit_text(f"❌ فشل التحميل:\n{error_msg}")
+        except:
+            pass
+        logger.error(f"Error with {url}: {e}")
     finally:
-        for path in [file_path, thumb_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        # حذف كل الملفات المتعلقة بالـ video_id (الأكثر أماناً)
+        if video_id:
+            for file in os.listdir(DOWNLOAD_DIR):
+                if video_id in file:
+                    try:
+                        os.remove(os.path.join(DOWNLOAD_DIR, file))
+                    except:
+                        pass
 
 # === تشغيل البوت ===
 print("🤖 البوت شغال ومستعد للتحميلات!")
