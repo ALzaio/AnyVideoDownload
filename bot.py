@@ -1,185 +1,112 @@
+#!/usr/bin/env python3
 import os
-import glob
-import asyncio
-import logging
-import subprocess
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import uuid
+import telebot
 import yt_dlp
+import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ANY_VIDEO_DL")
+TEMP_DIR = "downloads"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-app = Client("AnyVideoDownload", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ThreadPool لإدارة التحميلات المتعددة
+executor = ThreadPoolExecutor(max_workers=3)
 
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# قائمة لتخزين المهام الجارية
+current_tasks = {}
 
-user_urls = {}
+def get_output_path(extension="mp4"):
+    """Generate safe unique output file path."""
+    return os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{extension}")
 
+def clear_temp_files():
+    for f in os.listdir(TEMP_DIR):
+        try:
+            os.remove(os.path.join(TEMP_DIR, f))
+        except:
+            pass
 
-# ========================= PROGRESS BAR =========================
+def process_message(message, abort_flag):
+    user_id = message.chat.id
+    url = message.text.strip()
 
-def make_bar(percent):
-    filled = int(percent / 5)
-    empty = 20 - filled
-    return f"[{'█' * filled}{'░' * empty}] {percent:.1f}%"
+    bot.send_message(user_id, "⏳ جاري التحميل...")
 
+    output_path = get_output_path("mp4")
+    cookie_file = "cookies.txt"
+    ydl_opts = {
+        "outtmpl": output_path,
+        "ffmpeg_location": "/usr/local/bin/ffmpeg",  # Docker
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "nocheckcertificate": True,
+        "socket_timeout": 20,
+        "retries": 3
+    }
 
-async def update_progress(d, msg):
-    if d["status"] != "downloading":
-        return
+    if os.path.exists(cookie_file):
+        ydl_opts["cookiefile"] = cookie_file
 
-    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-    if not total:
-        return
-
-    downloaded = d.get("downloaded_bytes", 0)
-    percent = (downloaded / total) * 100
-    bar = make_bar(percent)
-
+    file_name = output_path  # fallback
     try:
-        await msg.edit_text(f"Downloading...\n{bar}")
-    except:
-        pass
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_name = ydl.prepare_filename(info)
+            if not os.path.exists(file_name):
+                file_name = output_path
 
+        if abort_flag["abort"]:
+            bot.send_message(user_id, "❌ تم إلغاء التحميل.")
+            return
 
-# ========================= VIDEO COMPRESSION =========================
+        file_size = os.path.getsize(file_name)
+        if file_size > 2000 * 1024 * 1024:
+            bot.send_message(user_id, "❌ حجم الملف أكبر من 2GB ولا يمكن رفعه.")
+            return
 
-async def compress_video(input_path):
-    size = os.path.getsize(input_path)
+        with open(file_name, "rb") as f:
+            bot.send_video(user_id, f)
 
-    # If <= 45MB → no need to compress
-    if size <= 45 * 1024 * 1024:
-        return input_path
+        bot.send_message(user_id, "✅ تم الإرسال بنجاح!")
 
-    output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
-
-    cmd = [
-        "ffmpeg",
-        "-i", input_path,
-        "-vcodec", "libx264",
-        "-preset", "veryfast",
-        "-crf", "28",
-        "-acodec", "aac",
-        "-b:a", "128k",
-        output_path
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    await process.communicate()
-
-    if os.path.exists(output_path) and os.path.getsize(output_path) < size:
-        return output_path
-
-    return input_path
-
-
-# ========================= COMMANDS =========================
-
-@app.on_message(filters.command(["start", "help"]))
-async def start(_, m):
-    await m.reply("Send video URL and choose format.")
-
-
-@app.on_message(filters.text & filters.regex(r"https?://"))
-async def handle_link(_, m):
-    user_urls[m.chat.id] = m.text.strip()
-    await m.reply(
-        "Choose format:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Video", "video"), InlineKeyboardButton("Audio", "audio")]
-        ])
-    )
-
-
-@app.on_callback_query()
-async def callback(c, cb):
-    url = user_urls.get(cb.message.chat.id)
-    if not url:
-        return await cb.answer("URL expired.", show_alert=True)
-
-    await cb.answer()
-    msg = await cb.message.reply("Analyzing...")
-
-    asyncio.create_task(download_and_send(c, cb.message.chat.id, url, cb.data == "audio", msg))
-
-
-# ========================= DOWNLOAD AND SEND =========================
-
-async def download_and_send(client, chat_id, url, is_audio, status_msg):
-    loop = asyncio.get_running_loop()
-    video_id = None
-
-    try:
-        opts = {
-            "format": "bestaudio/best" if is_audio else "best[height<=1080]+bestaudio/best",
-            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-            "writethumbnail": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "progress_hooks": [lambda d: asyncio.run_coroutine_threadsafe(update_progress(d, status_msg), loop)],
-        }
-
-        await status_msg.edit("Starting download...")
-
-        info = await loop.run_in_executor(
-            None,
-            lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=True)
-        )
-
-        video_id = info["id"]
-        title = info.get("title", "Media file")
-
-        # Detect files
-        files = glob.glob(f"{DOWNLOAD_DIR}/{video_id}*")
-        media = next((f for f in files if f.endswith((".mp4", ".mp3", ".webm", ".m4a", ".mkv")) and ".part" not in f), None)
-        thumb = next((f for f in files if f.endswith((".jpg", ".png", ".webp"))), None)
-
-        if not media:
-            return await status_msg.edit("Failed: media file missing.")
-
-        if not is_audio:
-            await status_msg.edit("Compressing video if needed...")
-            media = await compress_video(media)
-
-        await status_msg.edit("Uploading...")
-
-        caption = f"{title}\n\n@AnyVideoDownload"
-
-        if is_audio:
-            await client.send_audio(chat_id, media, caption=caption, thumb=thumb)
-        else:
-            await client.send_video(chat_id, media, caption=caption, thumb=thumb, supports_streaming=True)
-
-        await status_msg.delete()
-        await client.send_message(chat_id, "Done!")
-
-    except Exception as e:
-        await status_msg.edit(f"Error: {str(e)[:200]}")
-        logger.error(e)
-
+    except Exception:
+        print(traceback.format_exc())
+        bot.send_message(user_id, "❌ حدث خطأ أثناء التحميل. الرجاء تجربة رابط آخر.")
     finally:
-        if video_id:
-            for f in glob.glob(f"{DOWNLOAD_DIR}/{video_id}*"):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+        for f in [output_path, file_name]:
+            if os.path.exists(f):
+                try: os.remove(f)
+                except: pass
 
+# أوامر التحكم
+@bot.message_handler(commands=["clear"])
+def handle_clear(message):
+    clear_temp_files()
+    bot.send_message(message.chat.id, "🗑️ تم مسح جميع الملفات المؤقتة.")
 
-print("Bot is running...")
-app.run()
+@bot.message_handler(commands=["abort"])
+def handle_abort(message):
+    user_id = message.chat.id
+    if user_id in current_tasks:
+        current_tasks[user_id]["abort"] = True
+        bot.send_message(user_id, "⛔ جاري إلغاء التحميل...")
+    else:
+        bot.send_message(user_id, "⚠️ لا توجد عملية تحميل حالية لإلغائها.")
+
+@bot.message_handler(func=lambda msg: True)
+def handle_message(message):
+    abort_flag = {"abort": False}
+    current_tasks[message.chat.id] = abort_flag
+    executor.submit(process_message, message, abort_flag)
+
+print("🚀 البوت يعمل الآن...")
+bot.infinity_polling()
+
 
 
 
