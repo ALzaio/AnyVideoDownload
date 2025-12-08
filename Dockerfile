@@ -1,20 +1,35 @@
-# استخدام نسخة بايثون خفيفة
-FROM python:3.10-slim
+# ==============================
+# Dockerfile للبوت AnyVideoDownload
+# ==============================
 
-# هذا هو السطر السحري: تثبيت FFmpeg إجبارياً
-# FFmpeg لا تزال ضرورية لمعالجة الفيديوهات 
+# استخدام صورة Python 3.11 خفيفة
+FROM python:3.11-slim
+
+# تثبيت الأدوات الأساسية و ffmpeg
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        git \
+        curl \
+        && rm -rf /var/lib/apt/lists/*
 
-# إعداد مجلد العمل
+# إنشاء مجلد العمل
 WORKDIR /app
 
-# نسخ جميع ملفاتك إلى السيرفر
-COPY . . 
+# نسخ ملفات البوت إلى الحاوية
+COPY . /app
 
-# تثبيت مكتبات بايثون (Pyrogram و yt-dlp)
-RUN pip install --no-cache-dir -r requirements.txt
+# تثبيت مكتبات Python المطلوبة
+RUN pip install --no-cache-dir \
+        pyTelegramBotAPI \
+        yt-dlp
 
-# تشغيل البوت
-CMD ["python", "bot.py"]
+# إنشاء مجلد التنزيلات
+RUN mkdir -p downloads
+
+# البيئة المطلوبة
+ENV BOT_TOKEN="ضع_توكن_البوت_هنا"
+
+# بدء تشغيل البوت
+CMD ["python3", "bot.py"]
+
