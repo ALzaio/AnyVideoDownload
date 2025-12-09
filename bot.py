@@ -9,24 +9,20 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 # مكتبات تيليجرام
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# مكتبة التحميل
+# مكتبة التحميل ومعالجة الأخطاء
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError, GeoRestrictedError
 
 # ================= 1. الإعدادات =================
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# حدود Railway المعدلة حسب طلبك
 DOWNLOAD_DIR = "downloads"
-
-# 🚨 التعديل الأساسي: الحد الأقصى أصبح 300 ميجابايت
 MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB
-
-# 🚨 تعديل عتبة الضغط: نضغط الملفات التي بين 150 و 300 ميجا
 COMPRESSION_THRESHOLD = 150 * 1024 * 1024  # 150MB
 
 logging.basicConfig(level=logging.INFO)
@@ -47,20 +43,41 @@ if cookies_content:
             f.write(cookies_content)
     except: pass
 
-# ================= 3. الدوال المساعدة =================
+# ================= 3. دوال مساعدة وتنظيف =================
 
 def format_bytes(size):
-    if not size or size == 0: return "غير معروف"
+    if not size or size == 0: return "N/A"
     power = 2**10
     n = 0
     power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
     while size > power:
         size /= power
         n += 1
-    return f"{size:.2f} {power_labels[n]}B"
+    return f"{size:.1f}{power_labels[n]}B"
 
 class FileTooBigError(Exception): pass
 class UserCancelledError(Exception): pass
+
+async def scheduled_cleanup():
+    """مهمة خلفية لتنظيف الملفات القديمة كل ساعة"""
+    while True:
+        await asyncio.sleep(3600)  # انتظار ساعة
+        logger.info("🧹 بدء عملية التنظيف المجدولة...")
+        try:
+            now = time.time()
+            if os.path.exists(DOWNLOAD_DIR):
+                for filename in os.listdir(DOWNLOAD_DIR):
+                    filepath = os.path.join(DOWNLOAD_DIR, filename)
+                    # حذف الملفات التي مر عليها أكثر من ساعة
+                    if os.path.getmtime(filepath) < now - 3600:
+                        try:
+                            if os.path.isfile(filepath): os.remove(filepath)
+                            elif os.path.isdir(filepath): shutil.rmtree(filepath)
+                            logger.info(f"Deleted old file: {filename}")
+                        except Exception as e:
+                            logger.error(f"Error deleting {filename}: {e}")
+        except Exception as e:
+            logger.error(f"Cleanup loop error: {e}")
 
 def download_hook(d, chat_id):
     if d['status'] == 'downloading':
@@ -69,7 +86,6 @@ def download_hook(d, chat_id):
             raise FileTooBigError(f"تجاوز الحد: {format_bytes(d['downloaded_bytes'])}")
 
 def compress_video(input_path, chat_id):
-    """دالة ضغط الفيديو باستخدام FFmpeg"""
     size = os.path.getsize(input_path)
     if size <= COMPRESSION_THRESHOLD: return input_path
 
@@ -77,7 +93,6 @@ def compress_video(input_path, chat_id):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg: return input_path 
 
-    # إعدادات ضغط سريعة (Ultrafast) لتقليل استهلاك المعالج
     cmd = [
         ffmpeg, "-i", input_path,
         "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "35",
@@ -98,7 +113,6 @@ def compress_video(input_path, chat_id):
             if os.path.getsize(output_path) < size:
                 os.remove(input_path)
                 return output_path
-    except UserCancelledError: raise
     except:
         if process: process.kill()
     return input_path
@@ -120,25 +134,57 @@ async def progress_bar(current, total, message, start_time, chat_id):
         )
     except: pass
 
-# ================= 4. العمال (Workers) =================
+# ================= 4. العمال (Workers) وتحليل الجودة =================
 
-def info_worker(url):
-    """جلب المعلومات فقط"""
+def analyze_video_worker(url):
+    """جلب تفاصيل الفيديو والجودات المتاحة مع أحجامها"""
     ydl_opts = {
         "quiet": True, "nocheckcertificate": True, "skip_download": True, "noplaylist": True,
-        "format": "best", "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if 'entries' in info: info = info['entries'][0]
+            
             title = info.get('title', 'Video')
-            size = info.get('filesize_approx') or info.get('filesize') or 0
-            return title, size
-    except: return None, 0
+            
+            # استخراج الجودات المتاحة
+            formats_data = {}
+            if 'formats' in info:
+                for f in info['formats']:
+                    # تجاهل الصيغ الصوتية فقط أو الفيديو فقط (نبحث عن المدمجة أو القابلة للدمج)
+                    if not f.get('height'): continue
+                    
+                    height = f.get('height')
+                    filesize = f.get('filesize') or f.get('filesize_approx') or 0
+                    
+                    # نختار أفضل حجم تقديري لكل دقة
+                    # (yt-dlp يفصل الفيديو عن الصوت، لذا الحجم هنا تقريبي للفيديو فقط غالباً)
+                    # نقوم بزيادة تقديرية 10% للصوت
+                    if filesize:
+                        filesize = int(filesize * 1.1)
+                        
+                    # حفظ أكبر حجم متوقع لهذه الدقة (لضمان الأمان)
+                    if height not in formats_data or filesize > formats_data[height]:
+                        formats_data[height] = filesize
+
+            return {
+                "title": title,
+                "formats": formats_data,
+                "duration": info.get('duration'),
+                "error": None
+            }
+            
+    except GeoRestrictedError:
+        return {"error": "❌ هذا الفيديو محظور في دولة السيرفر."}
+    except DownloadError as e:
+        if "live event" in str(e): return {"error": "❌ لا يمكن تحميل البث المباشر."}
+        return {"error": f"❌ خطأ في التحميل: {str(e)[:50]}"}
+    except Exception as e:
+        return {"error": f"❌ خطأ عام: {str(e)}"}
 
 def get_stream_link_worker(url):
-    """جلب رابط مباشر للبث"""
     ydl_opts = {
         "quiet": True, "nocheckcertificate": True, "skip_download": True,
         "format": "best", "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
@@ -149,22 +195,28 @@ def get_stream_link_worker(url):
             return info.get('url'), info.get('title')
     except Exception as e: return None, str(e)
 
-def download_worker(client, chat_id, message_id, url, quality, is_audio):
+def download_worker(client, chat_id, message_id, url, quality_setting, is_audio):
     cancel_flags[chat_id] = False
     unique_id = uuid.uuid4().hex[:8]
     output_template = f"{DOWNLOAD_DIR}/{unique_id}_%(title)s.%(ext)s"
     
     ydl_opts = {
-        "outtmpl": output_template, "quiet": True, "nocheckcertificate": True, "restrictfilenames": True,
-        "progress_hooks": [lambda d: download_hook(d, chat_id)],
+        "outtmpl": output_template, "quiet": True, "nocheckcertificate": True,
+        "restrictfilenames": True, "progress_hooks": [lambda d: download_hook(d, chat_id)],
     }
     if os.path.exists(COOKIES_FILE): ydl_opts["cookiefile"] = COOKIES_FILE
 
     if is_audio: 
         ydl_opts.update({"format": "bestaudio/best", "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
     else:
-        if quality == "best": ydl_opts["format"] = "bestvideo+bestaudio/best"
-        else: ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        # تحديد الجودة بناءً على اختيار المستخدم
+        if quality_setting == "best":
+            ydl_opts["format"] = f"bestvideo[filesize<{MAX_FILE_SIZE}]+bestaudio/best"
+        else:
+            # محاولة جلب الدقة المطلوبة أو أقل
+            target_h = int(quality_setting)
+            ydl_opts["format"] = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/best"
+            
         ydl_opts["merge_output_format"] = "mp4"
 
     final_path, title = None, "Video"
@@ -179,17 +231,15 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
 
         if not is_audio and final_path and os.path.exists(final_path):
             f_size = os.path.getsize(final_path)
-            # فحص أخير للحجم بعد التحميل
             if f_size > MAX_FILE_SIZE:
                 os.remove(final_path)
-                return None, None, f"الملف ({format_bytes(f_size)}) أكبر من الحد المسموح ({format_bytes(MAX_FILE_SIZE)})."
+                return None, None, f"عذراً، الملف الناتج ({format_bytes(f_size)}) أكبر من الحد المسموح."
             
-            # ضغط الفيديو إذا كان حجمه أكبر من عتبة الضغط وأقل من الحد الأقصى
             if f_size > COMPRESSION_THRESHOLD:
                 client.loop.call_soon_threadsafe(
                     asyncio.create_task,
                     client.edit_message_text(
-                        chat_id, message_id, f"🔨 **الحجم {format_bytes(f_size)}**\nجاري الضغط لتقليل الحجم...",
+                        chat_id, message_id, f"🔨 **الحجم {format_bytes(f_size)}**\nجاري الضغط...",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
                     )
                 )
@@ -206,49 +256,89 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
 
 @app.on_message(filters.command(["start"]))
 async def start(client, message):
-    await message.reply_text("👋 أهلاً! أرسل رابط فيديو (يوتيوب، فيسبوك، انستقرام...)")
-
-@app.on_message(filters.command("clear"))
-async def clear(client, message):
-    if os.path.exists(DOWNLOAD_DIR): shutil.rmtree(DOWNLOAD_DIR)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await message.reply_text("✅ تم تنظيف المخلفات")
+    await message.reply_text("👋 أهلاً! أرسل رابط فيديو لتحليله.")
 
 @app.on_message(filters.text & filters.regex(r"http"))
 async def link_handler(client, message):
     url = message.text.strip()
-    status = await message.reply_text("🔎 **جاري فحص الرابط...**")
+    status = await message.reply_text("🔎 **جاري تحليل الرابط والخيارات المتاحة...**")
     
     loop = asyncio.get_event_loop()
-    title, size = await loop.run_in_executor(executor, info_worker, url)
+    # استخدام المحلل الذكي الجديد
+    result = await loop.run_in_executor(executor, analyze_video_worker, url)
+    
     await status.delete()
 
-    if not title: return await message.reply_text("❌ رابط غير صالح أو محتوى خاص")
+    if result.get("error"):
+        return await message.reply_text(result["error"])
 
+    title = result["title"]
+    formats = result["formats"] # قاموس {الدقة: الحجم}
+    
     user_pending_data[message.chat.id] = {"url": url}
-    size_txt = format_bytes(size)
-
-    # 🚨 منطق الشرط الجديد: 300MB 🚨
-    if size > MAX_FILE_SIZE:
-        # الحالة الأولى: الملف ضخم جداً -> عرض خيار المشاهدة فقط
-        warning = f"\n⚠️ **تنبيه:** الحجم ({size_txt}) أكبر من 300MB.\n⚠️ لا يمكن تحميل هذا الملف لسيرفرات تيليجرام مباشرة.\n✅ **الحل:** استخدم الرابط المباشر أدناه."
+    
+    # بناء الأزرار ديناميكياً بناءً على الحجم
+    buttons = []
+    
+    # زر الصوت دائماً متاح
+    buttons.append([InlineKeyboardButton("🎵 تحويل صوت (MP3)", callback_data="audio")])
+    
+    # فلترة خيارات الفيديو
+    valid_video_options = []
+    
+    # ترتيب الدقات المهمة
+    priority_qualities = [1080, 720, 480, 360]
+    
+    has_downloadable_video = False
+    
+    for q in priority_qualities:
+        # البحث عن أقرب دقة متوفرة في حدود ±
+        # للتبسيط، نتحقق إذا كانت الدقة موجودة أو قريبة منها في البيانات
+        # هنا سنعتمد على ما وجده المحلل
         
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ مشاهدة مباشرة (Direct Link)", callback_data="method_stream")]
-        ])
+        # إذا لم نجد حجم للدقة، نفترض أنها متاحة إذا كانت منخفضة (360/480)
+        # أو نتجاهلها إذا كانت عالية. هنا سنعتمد على البيانات الموجودة.
+        
+        # تحسين: عرض الخيارات الموجودة فعلياً في formats
+        # نجمع الدقات المتوفرة
+        closest_h = None
+        for h_avail in formats.keys():
+            if abs(h_avail - q) < 100: # هامش تقريبي
+                closest_h = h_avail
+                break
+        
+        if closest_h:
+            size = formats[closest_h]
+            size_lbl = format_bytes(size) if size > 0 else "N/A"
+            
+            # 🚨 الفلتر الذكي للحجم 🚨
+            if size > 0 and size > MAX_FILE_SIZE:
+                # إذا كان الحجم معروفاً وأكبر من الحد، لا نضيف الزر
+                pass 
+            else:
+                btn_txt = f"🎥 {q}p ({size_lbl})"
+                valid_video_options.append(InlineKeyboardButton(btn_txt, callback_data=f"vid_{q}"))
+                has_downloadable_video = True
+
+    # إضافة خيار "أفضل جودة ممكنة" بشرط
+    buttons.append([InlineKeyboardButton("✨ أفضل جودة متاحة (<300MB)", callback_data="vid_best")])
+
+    # تنسيق الأزرار في صفوف (زرين في كل صف)
+    video_rows = [valid_video_options[i:i+2] for i in range(0, len(valid_video_options), 2)]
+    for row in video_rows:
+        buttons.append(row)
+
+    # زر الرابط المباشر دائماً موجود كخيار احتياطي
+    buttons.append([InlineKeyboardButton("▶️ رابط مباشر (بدون تحميل)", callback_data="method_stream")])
+
+    if not has_downloadable_video and len(formats) > 0:
+        warning = "\n⚠️ **ملاحظة:** جميع جودات الفيديو تبدو أكبر من 300MB."
     else:
-        # الحالة الثانية: الملف ضمن الحدود المسموحة -> عرض كل الخيارات
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📥 تحميل للمحادثة", callback_data="method_download"),
-                InlineKeyboardButton("▶️ رابط مباشر", callback_data="method_stream")
-            ]
-        ])
         warning = ""
 
     await message.reply_text(
-        f"📺 **{title}**\n💾 الحجم المتوقع: {size_txt}{warning}",
-        reply_markup=kb
+        f"📺 **{title}**{warning}\n⬇️ اختر الجودة المناسبة:",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 @app.on_callback_query()
@@ -259,39 +349,25 @@ async def callback(client, call):
         return
 
     data = user_pending_data.get(call.message.chat.id)
-    if not data: return await call.answer("انتهت جلسة هذا الرابط، أرسله مجدداً", show_alert=True)
+    if not data: return await call.answer("انتهت الجلسة", show_alert=True)
     url = data["url"]
 
-    # --- مسار 1: المشاهدة المباشرة ---
     if call.data == "method_stream":
-        await call.message.edit_text("⏳ **جاري استخراج رابط البث...**")
+        await call.message.edit_text("⏳ **جاري استخراج الرابط...**")
         loop = asyncio.get_event_loop()
         stream_url, title = await loop.run_in_executor(executor, get_stream_link_worker, url)
-        
         if stream_url:
-            await call.message.edit_text(
-                f"✅ **تم جلب الرابط!**\n🎬 {title}\n\n🔗 [اضغط هنا للمشاهدة]({stream_url})\n\n⚠️ الرابط يعمل لفترة مؤقتة ويدعم السرعات العالية.",
-                disable_web_page_preview=True
-            )
+            await call.message.edit_text(f"✅ **{title}**\n\n🔗 [اضغط للمشاهدة]({stream_url})", disable_web_page_preview=True)
         else:
-            await call.message.edit_text("❌ فشل جلب رابط البث.")
+            await call.message.edit_text("❌ فشل استخراج الرابط")
         return
 
-    # --- مسار 2: التحميل (عرض الجودات) ---
-    if call.data == "method_download":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 صوت (MP3)", callback_data="audio"), InlineKeyboardButton("🎥 فيديو (Best)", callback_data="vid_best")],
-            [InlineKeyboardButton("🎥 720p", callback_data="vid_720"), InlineKeyboardButton("🎥 360p", callback_data="vid_360")]
-        ])
-        await call.message.edit_text("⬇️ اختر الجودة:", reply_markup=kb)
-        return
-
-    # --- مسار 3: التنفيذ ---
+    # التحميل
     is_audio = (call.data == "audio")
-    quality = call.data.split("_")[1] if "vid" in call.data else "720"
+    quality = call.data.split("_")[1] if "vid" in call.data else "best"
 
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
-    await call.message.edit_text("⏳ جاري التحميل إلى السيرفر...", reply_markup=cancel_btn)
+    await call.message.edit_text("⏳ جاري المعالجة...", reply_markup=cancel_btn)
 
     loop = asyncio.get_event_loop()
     path, title, err = await loop.run_in_executor(
@@ -300,12 +376,12 @@ async def callback(client, call):
 
     if err:
         if path and os.path.exists(path): os.remove(path)
-        return await call.message.edit_text(f"❌ خطأ: {err}")
+        return await call.message.edit_text(f"❌ {err}")
     
     if not path: return await call.message.edit_text("❌ فشل غير معروف")
 
     try:
-        await call.message.edit_text("⬆️ جاري الرفع إلى تيليجرام...", reply_markup=cancel_btn)
+        await call.message.edit_text("⬆️ جاري الرفع...", reply_markup=cancel_btn)
         args = (call.message, [time.time(), time.time()], call.message.chat.id)
         
         if is_audio: await client.send_audio(call.message.chat.id, path, caption=title, progress=progress_bar, progress_args=args)
@@ -314,10 +390,23 @@ async def callback(client, call):
         await call.message.delete()
     except Exception as e:
         if not cancel_flags.get(call.message.chat.id):
-            await call.message.edit_text(f"❌ فشل الرفع: {e}")
+            await call.message.edit_text(f"❌ خطأ الرفع: {e}")
     finally:
         if os.path.exists(path): os.remove(path)
 
-if __name__ == "__main__":
+# ================= 6. التشغيل =================
+async def main():
+    # إنشاء مجلد التحميل
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    app.run()
+    
+    # تشغيل مهمة التنظيف في الخلفية
+    asyncio.create_task(scheduled_cleanup())
+    
+    # بدء البوت
+    logger.info("🤖 Bot started...")
+    await app.start()
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
