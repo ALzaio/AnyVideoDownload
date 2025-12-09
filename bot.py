@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # مجلد التحميلات
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB حد تيليجرام
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 2GB حد تيليجرام
 COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم محاولة ضغطه)
 
 # إعداد السجل (Logging)
@@ -37,7 +37,7 @@ app = Client("super_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_pending_links = {}
 
 # executor لتشغيل المهام الثقيلة في الخلفية
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=2)
 
 # ================= 2. التعامل مع الكوكيز (من الكود الأول) =================
 COOKIES_FILE = "cookies.txt"
@@ -315,4 +315,5 @@ if __name__ == "__main__":
 
     print("🚀 Super Bot is Running...")
     app.run()
+
 
