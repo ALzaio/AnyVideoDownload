@@ -268,7 +268,7 @@ async def callback_handler(client, callback):
         await callback.message.edit_text("⬆️ **جاري الرفع...**")
         start_time = [time.time(), time.time()] # للتحكم في تحديث البروجرس
         
-        caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via @YourBot"
+        caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via @TikInstaDL_bot"
         
         # إرسال Action (جاري رفع ملف...)
         await client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
@@ -315,3 +315,4 @@ if __name__ == "__main__":
 
     print("🚀 Super Bot is Running...")
     app.run()
+
