@@ -22,8 +22,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # إعدادات المجلدات والحدود (مخصصة لسيرفر Railway الضعيف)
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (لحماية القرص 1GB)
-COMPRESSION_THRESHOLD = 300 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
+MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (الحد الأقصى المطلق لحماية القرص)
+COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 200MB (أي ملف أكبر من هذا سيتم ضغطه)
 
 # إعداد السجل (Logging)
 logging.basicConfig(level=logging.INFO)
@@ -62,9 +62,8 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 def compress_video(input_path):
-    """ضغط الفيديو باستخدام FFmpeg مع إصلاح مشكلة التشغيل"""
+    """ضغط الفيديو باستخدام FFmpeg بأقصى ضغط لتقليل الحمل على CPU"""
     size = os.path.getsize(input_path)
-    # إذا الملف أصغر من الحد المسموح، لا تضغطه
     if size <= COMPRESSION_THRESHOLD:
         return input_path
 
@@ -74,12 +73,12 @@ def compress_video(input_path):
     if not ffmpeg_path:
         return input_path 
 
-    # إعدادات ضغط متوازنة مع إصلاح صيغة الألوان
+    # إعدادات ضغط قوية (CRF 35) وسريعة (superfast) ومتوافقة (yuv420p)
     cmd = [
         ffmpeg_path, "-i", input_path,
         "-vcodec", "libx264", 
         "-preset", "superfast", 
-        "-crf", "35", 
+        "-crf", "35",  
         "-pix_fmt", "yuv420p", 
         "-acodec", "aac", 
         "-b:a", "128k",
@@ -91,16 +90,19 @@ def compress_video(input_path):
         # مهلة 5 دقائق
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
         
-        # التحقق من نجاح الضغط
+        # التحقق من نجاح الضغط وحجم الملف الجديد
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            os.remove(input_path) # حذف الأصلي
-            return output_path
+            # التحقق هل الحجم الجديد أصغر فعلاً؟
+            if os.path.getsize(output_path) < size:
+                os.remove(input_path)
+                return output_path
+            else:
+                os.remove(output_path) # حذف الملف المضغوط لأنه أكبر أو يساوي الأصلي
     except subprocess.TimeoutExpired:
-        logger.warning("Compression timed out, returning original file.")
+        logger.error("Compression timed out (300s).")
     except Exception as e:
-        logger.error(f"Compression failed: {e}")
+        logger.error(f"Compression failed with exception: {e}")
     
-    # في حالة الفشل نعود للملف الأصلي
     return input_path
 
 async def progress_bar(current, total, message, start_time):
@@ -125,13 +127,29 @@ async def progress_bar(current, total, message, start_time):
     except:
         pass
 
-# ================= 4. العامل (Worker) - تحميل وضغط =================
+# ================= 4. العمال (Workers) =================
+
+def check_file_size_worker(url):
+    """التحقق المسبق من حجم الفيديو قبل التحميل"""
+    ydl_opts = {
+        "quiet": True,
+        "nocheckcertificate": True,
+        "skip_download": True,
+        "format": "best",
+        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            expected_size = info.get("filesize_approx") or info.get("filesize") or 0
+            return True, expected_size
+    except Exception as e:
+        logger.error(f"Pre-check failed: {e}")
+        return None, 0
 
 def download_worker(client, chat_id, message_id, url, quality, is_audio):
-    """
-    هذه الدالة تعمل في الخلفية (Thread).
-    تقوم بالتحميل، وإذا كان الملف كبيراً تقوم بتحديث الرسالة ثم الضغط.
-    """
+    """دالة التحميل والضغط"""
     
     unique_id = uuid.uuid4().hex[:8]
     output_template = f"{DOWNLOAD_DIR}/{unique_id}_%(title)s.%(ext)s"
@@ -169,7 +187,6 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
     try:
         # 1. مرحلة التحميل
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # التحقق من المعلومات أولاً (اختياري لتسريع العملية)
             info = ydl.extract_info(url, download=True)
             file_title = info.get('title', 'Video')
             
@@ -180,25 +197,24 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
                 if is_audio and not final_path.endswith(".mp3"):
                     final_path = final_path.rsplit(".", 1)[0] + ".mp3"
 
-        # 2. مرحلة التحقق والضغط (التعديل المطلوب)
+        # 2. مرحلة التحقق والضغط
         if not is_audio and final_path and os.path.exists(final_path):
             file_size = os.path.getsize(final_path)
             
-            # حماية القرص: إذا الملف أكبر من 900 ميجا احذفه فوراً
+            # حماية القرص (طبقة أمان ثانية)
             if file_size > MAX_FILE_SIZE:
                 os.remove(final_path)
-                return None, None, f"عذراً، الملف ({format_bytes(file_size)}) أكبر من حد السيرفر المسموح (900MB)."
+                return None, None, f"عذراً، الملف ({format_bytes(file_size)}) أكبر من حد السيرفر (900MB)."
 
-            # إذا الملف أكبر من 50 ميجا -> تنبيه المستخدم ثم الضغط
+            # الضغط إذا تجاوز الحد
             if file_size > COMPRESSION_THRESHOLD:
                 msg_text = (
                     f"⚙️ **جاري المعالجة...**\n"
                     f"📁 الحجم الأصلي: {format_bytes(file_size)}\n"
-                    f"🔨 يتم الآن ضغط الفيديو لتقليل الحجم...\n"
-                    f"⚠️ قد تستغرق العملية بضع دقائق، يرجى الانتظار."
+                    f"🔨 يتم ضغط الفيديو لتوفير المساحة...\n"
+                    f"⚠️ قد تستغرق العملية بضع دقائق."
                 )
                 
-                # إرسال التحديث من الـ Thread إلى Pyrogram
                 client.loop.call_soon_threadsafe(
                     asyncio.create_task,
                     client.edit_message_text(
@@ -208,7 +224,6 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
                     )
                 )
                 
-                # بدء الضغط
                 final_path = compress_video(final_path)
 
         return final_path, file_title, None
@@ -224,7 +239,7 @@ async def start_handler(client, message):
         "👋 **أهلاً بك!**\n"
         "أرسل رابط فيديو للتحميل.\n"
         "🔹 أدعم: يوتيوب، تيك توك، فيسبوك، انستقرام.\n"
-        "🔹 أقوم بضغط الفيديوهات الكبيرة تلقائياً.\n"
+        "🔹 **الحد الأقصى للملفات:** 900MB\n"
         "🧹 أمر التنظيف: /clear"
     )
 
@@ -242,6 +257,33 @@ async def clear_handler(client, message):
 @app.on_message(filters.text & filters.regex(r"http"))
 async def link_handler(client, message):
     url = message.text.strip()
+    
+    # رسالة الفحص
+    status_msg = await message.reply_text("🔎 **جاري فحص الرابط والحجم...**")
+    
+    loop = asyncio.get_event_loop()
+    
+    # تشغيل الفحص المسبق
+    is_valid, expected_size = await loop.run_in_executor(
+        executor, check_file_size_worker, url
+    )
+
+    await status_msg.delete()
+
+    if is_valid is None:
+        await message.reply_text("❌ فشل الاتصال بالمصدر أو الرابط غير مدعوم.")
+        return
+
+    # التحقق من الحجم قبل عرض الأزرار
+    if expected_size > MAX_FILE_SIZE:
+        await message.reply_text(
+            f"⛔ **الملف كبير جداً!**\n"
+            f"الحجم المتوقع: {format_bytes(expected_size)}\n"
+            f"الحد الأقصى للسيرفر: {format_bytes(MAX_FILE_SIZE)}"
+        )
+        return
+
+    # إذا الملف مناسب، نعرض الأزرار
     user_pending_links[message.chat.id] = url
     
     keyboard = InlineKeyboardMarkup([
@@ -257,7 +299,8 @@ async def link_handler(client, message):
     ])
     
     await message.reply_text(
-        "⬇️ **تم استلام الرابط!** اختر الجودة:",
+        f"✅ **الرابط مقبول** ({format_bytes(expected_size) if expected_size else 'غير محدد'})\n"
+        "⬇️ اختر الجودة المطلوبة:",
         reply_markup=keyboard,
         quote=True
     )
@@ -276,13 +319,10 @@ async def callback_handler(client, callback):
     is_audio = (data == "audio")
     quality = data.split("_")[1] if data.startswith("vid_") else "720"
 
-    # تحديث الرسالة إلى "جاري التحميل"
-    await callback.message.edit_text(f"⏳ **جاري التحميل من المصدر...**\n⚙️ النوع: {quality if not is_audio else 'MP3'}")
+    await callback.message.edit_text(f"⏳ **جاري التحميل...**\n⚙️ النوع: {quality if not is_audio else 'MP3'}")
     
     loop = asyncio.get_event_loop()
     
-    # تشغيل العامل (Worker) في الخلفية
-    # نمرر client, chat_id, message_id ليتمكن من تحديث الرسالة عند الضغط
     file_path, title, error = await loop.run_in_executor(
         executor, download_worker, client, chat_id, message_id, url, quality, is_audio
     )
@@ -292,12 +332,11 @@ async def callback_handler(client, callback):
         return
         
     if not file_path or not os.path.exists(file_path):
-        await callback.message.edit_text("❌ لم يتم العثور على الملف بعد التحميل.")
+        await callback.message.edit_text("❌ لم يتم العثور على الملف.")
         return
 
-    # الرفع إلى تيليجرام
     try:
-        await callback.message.edit_text("⬆️ **جاري الرفع إلى تيليجرام...**")
+        await callback.message.edit_text("⬆️ **جاري الرفع...**")
         start_time = [time.time(), time.time()]
         
         caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via Bot"
@@ -330,7 +369,6 @@ async def callback_handler(client, callback):
         await callback.message.edit_text(f"❌ فشل الرفع: {e}")
     
     finally:
-        # تنظيف الملف دائماً
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -344,12 +382,3 @@ if __name__ == "__main__":
     
     print("🚀 Bot is running on Railway...")
     app.run()
-    app.run()
-
-
-
-
-
-
-
-
