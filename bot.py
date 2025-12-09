@@ -1,521 +1,317 @@
 #!/usr/bin/env python3
-
 import os
-
-import uuid
-
-import telebot
-
-from telebot import types
-
-import yt_dlp
-
-import traceback
-
-import shutil
-
-import subprocess
-
 import time
-
+import asyncio
+import logging
+import shutil
+import subprocess
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+# مكتبات تيليجرام (Pyrogram - الأسرع)
+from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 
+# مكتبة التحميل
+import yt_dlp
 
-# جلب التوكن
+# ================= 1. الإعدادات والتوكن =================
+# يجب الحصول على API_ID و API_HASH من https://my.telegram.org
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# مجلد التحميلات
+DOWNLOAD_DIR = "downloads"
+MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB حد تيليجرام
+COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم محاولة ضغطه)
 
+# إعداد السجل (Logging)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# إنشاء العميل
+app = Client("super_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-if not BOT_TOKEN:
+# تخزين الروابط مؤقتاً لربطها باختيار المستخدم
+user_pending_links = {}
 
-    print("Error: BOT_TOKEN is missing!")
+# executor لتشغيل المهام الثقيلة في الخلفية
+executor = ThreadPoolExecutor(max_workers=4)
 
-    exit(1)
-
-
-
-bot = telebot.TeleBot(BOT_TOKEN)
-
-
-
-# ================= إضافة الكوكيز =================
-
-cookies_content = os.getenv("COOKIES_CONTENT")
-
+# ================= 2. التعامل مع الكوكيز (من الكود الأول) =================
+COOKIES_FILE = "cookies.txt"
+cookies_content = os.environ.get("COOKIES_CONTENT")
 if cookies_content:
-
     try:
-
-        with open("cookies.txt", "w") as f:
-
+        with open(COOKIES_FILE, "w") as f:
             f.write(cookies_content)
-
-        print("✅ تم استعادة ملف الكوكيز.")
-
+        logger.info("✅ Cookies file created successfully.")
     except Exception as e:
+        logger.error(f"⚠️ Error creating cookies: {e}")
 
-        print(f"⚠️ خطأ في الكوكيز: {e}")
+# ================= 3. دوال مساعدة (ضغط وفورمات) =================
 
-# ===============================================
+def format_bytes(size):
+    power = 2**10
+    n = 0
+    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {power_labels[n]}B"
 
-
-
-TEMP_DIR = "downloads"
-
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-
-
-executor = ThreadPoolExecutor(max_workers=2)
-
-current_tasks = {}
-
-# قاموس لتخزين الرابط مؤقتاً حتى يختار المستخدم الدقة
-
-pending_links = {}
-
-
-
-MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
-
-COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB
-
-
-
-# =================== Utilities ===================
-
-
-
-def get_output_path(extension="mp4"):
-
-    return os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{extension}")
-
-
-
-def clear_temp_files():
-
-    if os.path.exists(TEMP_DIR):
-
-        shutil.rmtree(TEMP_DIR)
-
-        os.makedirs(TEMP_DIR, exist_ok=True)
-
-
-
+# دالة ضغط الفيديو (من الكود الأول) لتقليل الحجم
 def compress_video(input_path):
-
-    size = os.path.getsize(input_path)
-
-    if size <= COMPRESSION_THRESHOLD:
-
+    # إذا الملف أصغر من 50 ميجا، لا تضغطه
+    if os.path.getsize(input_path) <= COMPRESSION_THRESHOLD:
         return input_path
-
-
 
     output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
+    ffmpeg_path = shutil.which("ffmpeg")
+    
+    if not ffmpeg_path:
+        return input_path # FFmpeg غير موجود
 
-    ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-
-
-
+    # إعدادات ضغط سريعة ومتوازنة
     cmd = [
-
         ffmpeg_path, "-i", input_path,
-
-        "-vcodec", "libx264", "-preset", "ultrafast",
-
-        "-crf", "32", "-acodec", "aac", "-b:a", "128k",
-
+        "-vcodec", "libx264", "-preset", "superfast", 
+        "-crf", "30", # جودة متوسطة لتقليل الحجم
+        "-acodec", "aac", "-b:a", "128k",
         output_path
-
     ]
-
+    
     try:
-
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=400)
-
-    except subprocess.TimeoutExpired:
-
-        return input_path
-
-
-
-    if os.path.exists(output_path) and os.path.getsize(output_path) < size:
-
-        return output_path
-
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+        # التحقق هل الضغط نجح وكان الملف الناتج أصغر
+        if os.path.exists(output_path) and os.path.getsize(output_path) < os.path.getsize(input_path):
+            os.remove(input_path) # حذف الأصلي
+            return output_path
+    except Exception as e:
+        logger.error(f"Compression failed: {e}")
+    
     return input_path
 
-
-
-# =================== Progress Bar ===================
-
-
-
-def make_bar(percent):
-
-    filled = int(percent / 5)
-
-    empty = 20 - filled
-
-    return f"[{'█'*filled}{'░'*empty}] {percent:.1f}%"
-
-
-
-def progress_hook(d, chat_id, message_id, abort_flag, last_update):
-
-    if abort_flag["abort"]:
-
-        raise yt_dlp.utils.DownloadError("Cancelled")
-
-
-
-    if d["status"] == "downloading":
-
-        now = time.time()
-
-        if now - last_update[0] < 4: # تحديث كل 4 ثواني
-
-            return
-
-        last_update[0] = now
-
-        
-
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-
-        downloaded = d.get("downloaded_bytes", 0)
-
-        percent = (downloaded / total) * 100
-
-        bar = make_bar(percent)
-
-        
-
-        try:
-
-            bot.edit_message_text(
-
-                chat_id=chat_id, 
-
-                message_id=message_id,
-
-                text=f"⏳ جاري التحميل...\n{bar}\n{downloaded//1024} KB / {total//1024} KB"
-
-            )
-
-        except: pass
-
-
-
-# =================== Core Logic ===================
-
-
-
-def process_download(chat_id, message_id, url, quality, is_audio, abort_flag):
-
-    output_path = get_output_path("mp3" if is_audio else "mp4")
-
+# شريط التقدم للرفع (ميزة Pyrogram)
+async def progress_bar(current, total, message: Message, start_time):
+    now = time.time()
+    # تحديث الرسالة كل 5 ثواني فقط لتجنب الحظر
+    if (now - start_time[0]) < 5: 
+        return
     
+    start_time[0] = now
+    percent = current * 100 / total
+    filled = int(percent / 10)
+    bar = '▓' * filled + '░' * (10 - filled)
+    speed = current / (now - start_time[1]) if (now - start_time[1]) > 0 else 0
+    
+    try:
+        await message.edit_text(
+            f"⬆️ **جاري الرفع...**\n"
+            f"{bar} {percent:.1f}%\n"
+            f"📦 الحجم: {format_bytes(current)} / {format_bytes(total)}\n"
+            f"🚀 السرعة: {format_bytes(speed)}/s"
+        )
+    except:
+        pass
 
-    # إعدادات yt-dlp
+# ================= 4. منطق التحميل (Core Logic) =================
 
+def download_worker(url, quality, is_audio):
+    """هذه الدالة تعمل في Thread منفصل لأنها متزامنة (Blocking)"""
+    
+    unique_id = uuid.uuid4().hex[:8]
+    output_template = f"{DOWNLOAD_DIR}/{unique_id}_%(title)s.%(ext)s"
+    
     ydl_opts = {
-
-        "outtmpl": output_path.replace(".mp3", "") if is_audio else output_path, # mp3 extension added by postprocessor
-
+        "outtmpl": output_template,
         "quiet": True,
-
+        "no_warnings": True,
         "nocheckcertificate": True,
-
-        "socket_timeout": 15
-
+        "restrictfilenames": True, # لتجنب الأسماء الغريبة
     }
 
-
+    # إضافة الكوكيز إذا وجدت
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
 
     if is_audio:
-
-        ydl_opts["format"] = "bestaudio/best"
-
-        ydl_opts["postprocessors"] = [{
-
-            'key': 'FFmpegExtractAudio',
-
-            'preferredcodec': 'mp3',
-
-            'preferredquality': '192',
-
-        }]
-
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
     else:
-
-        # اختيار الدقة المطلوبة
-
+        # منطق اختيار الجودة (من الكود الأول)
         if quality == "best":
-
             ydl_opts["format"] = "bestvideo+bestaudio/best"
-
         else:
-
-            ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
-
+            # محاولة جلب الجودة المطلوبة أو أقل، مع دمج الصوت
+            ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         ydl_opts["merge_output_format"] = "mp4"
 
-
-
-    if os.path.exists("cookies.txt"):
-
-        ydl_opts["cookiefile"] = "cookies.txt"
-
-
-
-    last_update = [0]
-
-    ydl_opts["progress_hooks"] = [lambda d: progress_hook(d, chat_id, message_id, abort_flag, last_update)]
-
-
-
-    final_file = output_path
-
-
+    final_path = None
+    file_title = "Unknown"
 
     try:
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
             info = ydl.extract_info(url, download=True)
-
-            # التأكد من اسم الملف النهائي (خاصة مع mp3 قد يتغير الامتداد)
-
-            if is_audio:
-
-                final_file = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
-
+            file_title = info.get('title', 'Video')
+            
+            # تحديد مسار الملف الناتج
+            if 'requested_downloads' in info:
+                final_path = info['requested_downloads'][0]['filepath']
             else:
+                final_path = ydl.prepare_filename(info)
+                if is_audio and not final_path.endswith(".mp3"):
+                    final_path = final_path.rsplit(".", 1)[0] + ".mp3"
 
-                final_file = ydl.prepare_filename(info)
+        # مرحلة الضغط (فقط للفيديو)
+        if not is_audio and final_path and os.path.exists(final_path):
+            final_path = compress_video(final_path)
 
-
-
-        if abort_flag["abort"]:
-
-            bot.edit_message_text("❌ تم إلغاء العملية.", chat_id, message_id)
-
-            return
-
-
-
-        # معالجة الفيديو (فقط إذا لم يكن صوت)
-
-        if not is_audio and os.path.exists(final_file):
-
-            size = os.path.getsize(final_file)
-
-            if size > COMPRESSION_THRESHOLD:
-
-                bot.edit_message_text(f"⚡ الحجم ({size//1024//1024}MB) كبير، جاري الضغط...", chat_id, message_id)
-
-                final_file = compress_video(final_file)
-
-
-
-        # الرفع
-
-        file_size = os.path.getsize(final_file)
-
-        if file_size > MAX_TELEGRAM_SIZE:
-
-            bot.edit_message_text(f"❌ الملف كبير جداً ({file_size//1024//1024}MB).", chat_id, message_id)
-
-            return
-
-
-
-        bot.edit_message_text("⬆️ جاري الرفع إلى تيليجرام...", chat_id, message_id)
-
-        
-
-        with open(final_file, "rb") as f:
-
-            if is_audio:
-
-                bot.send_audio(chat_id, f, caption=f"🎵 {info.get('title', 'Audio')}\n👤 {info.get('uploader', 'Unknown')}")
-
-            else:
-
-                bot.send_video(chat_id, f, caption=f"🎥 {info.get('title', 'Video')}\n⚙️ Quality: {quality}p")
-
-
-
-        # حذف رسالة الانتظار
-
-        try: bot.delete_message(chat_id, message_id)
-
-        except: pass
-
-        bot.send_message(chat_id, "✅ تم!")
-
-
+        return final_path, file_title, None
 
     except Exception as e:
+        return None, None, str(e)
 
-        print(traceback.format_exc())
+# ================= 5. معالجات البوت (Handlers) =================
 
-        bot.edit_message_text("❌ فشل التحميل. تأكد أن الرابط صالح.", chat_id, message_id)
+@app.on_message(filters.command(["start", "help"]))
+async def start_handler(client, message):
+    await message.reply_text(
+        "👋 **أهلاً بك في البوت المتكامل!**\n\n"
+        "أرسل رابط فيديو (يوتيوب، فيسبوك، انستا، تيك توك...) وسأقوم بتحميله.\n"
+        "🔹 أدعم اختيار الجودة (1080p, 720p, 360p).\n"
+        "🔹 أدعم تحويل الصوت (MP3).\n"
+        "🔹 أقوم بضغط الفيديوهات الكبيرة تلقائياً.\n"
+        "🧹 للأوامر: /clear لتنظيف المحادثة."
+    )
 
+@app.on_message(filters.command("clear"))
+async def clear_handler(client, message):
+    try:
+        await message.reply_text("🗑️ جاري التنظيف...")
+        # حذف المجلد المؤقت
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        # حذف الرسائل (اختياري)
+        msg_ids = [message.id + i for i in range(-20, 2)]
+        await client.delete_messages(message.chat.id, msg_ids)
+    except:
+        pass
 
+@app.on_message(filters.text & filters.regex(r"http"))
+async def link_handler(client, message):
+    url = message.text.strip()
+    user_pending_links[message.chat.id] = url
+    
+    # لوحة أزرار اختيار الجودة (من الكود الأول)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎵 MP3 (صوت)", callback_data="audio"),
+            InlineKeyboardButton("🎥 Best", callback_data="vid_best")
+        ],
+        [
+            InlineKeyboardButton("🎥 1080p", callback_data="vid_1080"),
+            InlineKeyboardButton("🎥 720p", callback_data="vid_720"),
+            InlineKeyboardButton("🎥 360p", callback_data="vid_360")
+        ]
+    ])
+    
+    await message.reply_text(
+        "⬇️ **تم استلام الرابط!**\nاختر الجودة المطلوبة:",
+        reply_markup=keyboard,
+        quote=True
+    )
 
-    finally:
+@app.on_callback_query()
+async def callback_handler(client, callback):
+    chat_id = callback.message.chat.id
+    data = callback.data
+    url = user_pending_links.get(chat_id)
 
-        # تنظيف
-
-        try:
-
-            if os.path.exists(final_file): os.remove(final_file)
-
-            if os.path.exists(output_path) and output_path != final_file: os.remove(output_path)
-
-        except: pass
-
-        if chat_id in current_tasks: del current_tasks[chat_id]
-
-
-
-# =================== Handlers ===================
-
-
-
-@bot.message_handler(commands=["start", "help"])
-
-def handle_help(message):
-
-    bot.reply_to(message, "👋 أهلاً زياد!\nأرسل رابط فيديو وسأعطيك خيارات التحميل (فيديو أو صوت).")
-
-
-
-@bot.message_handler(commands=["info"])
-
-def handle_info(message):
-
-    bot.reply_to(message, f"👤 User: ziad\n🆔 ID: {message.from_user.id}\n🤖 Bot: v2.5 (Quality Selector)")
-
-
-
-@bot.message_handler(commands=["clear"])
-
-def handle_clear(message):
-
-    clear_temp_files()
-
-    bot.reply_to(message, "🗑️ تم تنظيف السيرفر.")
-
-
-
-@bot.message_handler(func=lambda msg: True)
-
-def handle_message(message):
-
-    if not message.text.startswith("http"):
-
-        bot.reply_to(message, "⚠️ أرسل رابطاً صحيحاً.")
-
+    if not url:
+        await callback.answer("❌ الرابط انتهى، أرسله مجدداً.", show_alert=True)
         return
 
-
-
-    # حفظ الرابط مؤقتاً
-
-    pending_links[message.chat.id] = message.text.strip()
-
-
-
-    # إنشاء لوحة الأزرار
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-
-    btn_audio = types.InlineKeyboardButton("🎵 MP3 (صوت)", callback_data="audio")
-
-    btn_360 = types.InlineKeyboardButton("🎥 360p", callback_data="video_360")
-
-    btn_720 = types.InlineKeyboardButton("🎥 720p", callback_data="video_720")
-
-    btn_1080 = types.InlineKeyboardButton("🎥 1080p", callback_data="video_1080")
-
-    
-
-    markup.add(btn_audio)
-
-    markup.add(btn_360, btn_720, btn_1080)
-
-
-
-    bot.send_message(message.chat.id, "⬇️ اختر الجودة المطلوبة:", reply_markup=markup)
-
-
-
-@bot.callback_query_handler(func=lambda call: True)
-
-def handle_query(call):
-
-    chat_id = call.message.chat.id
-
-    
-
-    if chat_id not in pending_links:
-
-        bot.answer_callback_query(call.id, "⚠️ الرابط انتهت صلاحيته، أرسله مجدداً.")
-
-        return
-
-
-
-    url = pending_links[chat_id]
-
-    del pending_links[chat_id] # حذف الرابط بعد الاستخدام
-
-    
-
-    # إخفاء الأزرار
-
-    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-
-    bot.edit_message_text(f"⏳ تم اختيار {call.data}. جاري البدء...", chat_id, call.message.message_id)
-
-
-
-    # تحديد الإعدادات
-
+    # تحديد الإعدادات بناءً على الزر
     is_audio = False
-
     quality = "720"
-
-
-
-    if call.data == "audio":
-
-        is_audio = True
-
-    elif call.data.startswith("video_"):
-
-        quality = call.data.split("_")[1]
-
-
-
-    abort_flag = {"abort": False}
-
-    current_tasks[chat_id] = abort_flag
-
     
+    if data == "audio":
+        is_audio = True
+    elif data.startswith("vid_"):
+        quality = data.split("_")[1]
 
-    executor.submit(process_download, chat_id, call.message.message_id, url, quality, is_audio, abort_flag)
+    # حذف الأزرار وتحديث الرسالة
+    await callback.message.edit_text(f"⏳ **جاري التحميل والمعالجة...**\n⚙️ الجودة: {quality if not is_audio else 'MP3'}")
+    
+    # بدء التحميل في الخلفية (Thread)
+    loop = asyncio.get_event_loop()
+    # نستخدم executor لتجنب تجميد البوت
+    file_path, title, error = await loop.run_in_executor(
+        executor, download_worker, url, quality, is_audio
+    )
 
+    if error or not file_path or not os.path.exists(file_path):
+        await callback.message.edit_text(f"❌ فشل التحميل: {error or 'Unknown Error'}")
+        return
 
+    # الرفع إلى تيليجرام
+    try:
+        await callback.message.edit_text("⬆️ **جاري الرفع...**")
+        start_time = [time.time(), time.time()] # للتحكم في تحديث البروجرس
+        
+        caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via @YourBot"
+        
+        # إرسال Action (جاري رفع ملف...)
+        await client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
+
+        if is_audio:
+            await client.send_audio(
+                chat_id, 
+                file_path, 
+                caption=caption, 
+                title=title,
+                progress=progress_bar,
+                progress_args=(callback.message, start_time)
+            )
+        else:
+            await client.send_video(
+                chat_id, 
+                file_path, 
+                caption=caption, 
+                supports_streaming=True,
+                progress=progress_bar,
+                progress_args=(callback.message, start_time)
+            )
+        
+        await callback.message.delete() # حذف رسالة الانتظار
+        
+    except Exception as e:
+        logger.error(f"Upload Error: {e}")
+        await callback.message.edit_text(f"❌ خطأ أثناء الرفع: {e}")
+    
+    finally:
+        # تنظيف الملف
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+# ================= 6. التشغيل =================
 
 if __name__ == "__main__":
+    if not os.path.exists(DOWNLOAD_DIR):
+        os.makedirs(DOWNLOAD_DIR)
+    
+    # التحقق من وجود FFmpeg
+    if not shutil.which("ffmpeg"):
+        logger.warning("⚠️ FFmpeg not found! Compression and MP3 conversion might fail.")
 
-    print("🚀 Bot Started (Quality Select Edition)...")
-
-    bot.infinity_polling()
+    print("🚀 Super Bot is Running...")
+    app.run()
