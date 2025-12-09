@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # إعدادات المجلدات والحدود (مخصصة لسيرفر Railway الضعيف)
 DOWNLOAD_DIR = "downloads"
 MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (لحماية القرص 1GB)
-COMPRESSION_THRESHOLD = 100 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
+COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
 
 # إعداد السجل (Logging)
 logging.basicConfig(level=logging.INFO)
@@ -79,7 +79,7 @@ def compress_video(input_path):
         ffmpeg_path, "-i", input_path,
         "-vcodec", "libx264", 
         "-preset", "superfast", 
-        "-crf", "30", 
+        "-crf", "35", 
         "-pix_fmt", "yuv420p", 
         "-acodec", "aac", 
         "-b:a", "128k",
@@ -345,6 +345,7 @@ if __name__ == "__main__":
     print("🚀 Bot is running on Railway...")
     app.run()
     app.run()
+
 
 
 
