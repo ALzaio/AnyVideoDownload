@@ -75,11 +75,15 @@ def compress_video(input_path):
         return input_path 
 
     # إعدادات ضغط متوازنة (CRF 30)
-    cmd = [
+   cmd = [
         ffmpeg_path, "-i", input_path,
-        "-vcodec", "libx264", "-preset", "superfast", 
+        "-vcodec", "libx264", 
+        "-preset", "superfast", 
         "-crf", "30", 
-        "-acodec", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",   # <--- ⚠️ هذا هو السطر السحري للإصلاح
+        "-acodec", "aac", 
+        "-b:a", "128k",
+        "-movflags", "+faststart", # <--- يجعل الفيديو يعمل فوراً دون انتظار التحميل الكامل
         output_path
     ]
     
@@ -339,6 +343,7 @@ if __name__ == "__main__":
     print("🚀 Bot is running on Railway...")
     app.run()
     app.run()
+
 
 
 
