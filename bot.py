@@ -20,22 +20,20 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# حدود Railway
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB
-COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 200MB
+MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (حد صارم)
+COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 200MB (حد الضغط)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# تخزين البيانات
+# إدارة المهام
 user_pending_data = {} 
 executor = ThreadPoolExecutor(max_workers=2)
-
-# 🛑 قاموس التحكم في الإلغاء (New: Cancellation Control)
-# الهيكل: {chat_id: True/False} (True means cancel immediately)
-cancel_flags = {}
+cancel_flags = {} 
 
 # ================= 2. الكوكيز =================
 COOKIES_FILE = "cookies.txt"
@@ -44,13 +42,12 @@ if cookies_content:
     try:
         with open(COOKIES_FILE, "w") as f:
             f.write(cookies_content)
-    except Exception as e:
-        logger.error(f"Cookie Error: {e}")
+    except: pass
 
-# ================= 3. دوال مساعدة والاستثناءات =================
+# ================= 3. الدوال المساعدة =================
 
 def format_bytes(size):
-    if not size or size == 0: return "Unknown"
+    if not size or size == 0: return "غير معروف"
     power = 2**10
     n = 0
     power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
@@ -59,80 +56,69 @@ def format_bytes(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-class FileTooBigError(Exception):
-    pass
-
-class UserCancelledError(Exception):
-    """خطأ مخصص عند طلب المستخدم للإلغاء"""
-    pass
+class FileTooBigError(Exception): pass
+class UserCancelledError(Exception): pass
 
 def download_hook(d, chat_id):
-    """
-    مراقب التحميل: يفحص الحجم + طلب الإلغاء
-    """
+    """حارس التحميل: يراقب الحجم لحظة بلحظة"""
     if d['status'] == 'downloading':
-        # 1. فحص طلب الإلغاء (New)
-        if cancel_flags.get(chat_id, False):
-            raise UserCancelledError("تم الإلغاء بواسطة المستخدم.")
-
-        # 2. فحص الحدود
-        if d.get('total_bytes') and d['total_bytes'] > MAX_FILE_SIZE:
-            raise FileTooBigError("Total size exceeds limit.")
+        if cancel_flags.get(chat_id):
+            raise UserCancelledError("Cancelled")
         
-        if d.get('downloaded_bytes') and d['downloaded_bytes'] > MAX_FILE_SIZE:
-            raise FileTooBigError("Downloaded bytes exceeded limit.")
+        # قطع التحميل فوراً إذا تجاوز 900MB
+        if d.get('downloaded_bytes', 0) > MAX_FILE_SIZE:
+            raise FileTooBigError(f"تجاوز الحد: {format_bytes(d['downloaded_bytes'])}")
 
 def compress_video(input_path, chat_id):
-    """ضغط الفيديو مع دعم الإلغاء"""
     size = os.path.getsize(input_path)
-    if size <= COMPRESSION_THRESHOLD:
-        return input_path
+    if size <= COMPRESSION_THRESHOLD: return input_path
 
     output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path: return input_path 
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg: return input_path 
 
     cmd = [
-        ffmpeg_path, "-i", input_path,
-        "-vcodec", "libx264", "-preset", "superfast", "-crf", "35",
-        "-pix_fmt", "yuv420p", "-acodec", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", output_path
+        ffmpeg, "-i", input_path,
+        "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "35",
+        "-pix_fmt", "yuv420p", "-acodec", "aac", "-b:a", "64k",
+        "-movflags", "+faststart", "-y", output_path
     ]
     
+    process = None
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # حلقة انتظار لتمكين الإلغاء أثناء الضغط
         while process.poll() is None:
-            if cancel_flags.get(chat_id, False):
+            if cancel_flags.get(chat_id):
                 process.kill()
-                raise UserCancelledError("تم إلغاء الضغط.")
-            time.sleep(1) # فحص كل ثانية
+                raise UserCancelledError("Cancelled compression")
+            time.sleep(1)
             
-        if os.path.exists(output_path) and os.path.getsize(output_path) < size:
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             os.remove(input_path)
             return output_path
     except UserCancelledError:
-        raise # إعادة رفع الخطأ ليتم التقاطه في الخارج
+        raise
     except:
-        pass
+        if process: process.kill()
     
     return input_path
 
 async def progress_bar(current, total, message, start_time, chat_id):
-    # فحص الإلغاء أثناء الرفع
-    if cancel_flags.get(chat_id, False):
-        app.stop_transmission() # أمر خاص بـ Pyrogram لإيقاف الرفع
-        
+    if cancel_flags.get(chat_id):
+        app.stop_transmission()
+        return
+
     now = time.time()
     if (now - start_time[0]) < 5: return
     start_time[0] = now
+    
     percent = current * 100 / total
     filled = int(percent / 10)
     bar = '▓' * filled + '░' * (10 - filled)
+    
     try:
         await message.edit_text(
-            f"⬆️ **جاري الرفع...**\n{bar} {percent:.1f}%\n📦 {format_bytes(current)}",
+            f"⬆️ **جاري الرفع...**\n{bar} {percent:.1f}%\n📦 {format_bytes(current)} / {format_bytes(total)}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
         )
     except: pass
@@ -140,32 +126,42 @@ async def progress_bar(current, total, message, start_time, chat_id):
 # ================= 4. العمال (Workers) =================
 
 def info_worker(url):
+    """
+    🕵️ الجاسوس: يجلب المعلومات فقط بدون تحميل
+    """
     ydl_opts = {
-        "quiet": True, "nocheckcertificate": True, "skip_download": True,
+        "quiet": True, 
+        "nocheckcertificate": True, 
+        "skip_download": True, # ⚠️ هذا هو الأهم: لا تحمل شيئاً!
+        "noplaylist": True,
         "format": "best",
         "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # استخراج البيانات الوصفية فقط
             info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Unknown Title')
+            
+            # التعامل مع القوائم (أخذ أول فيديو)
+            if 'entries' in info:
+                info = info['entries'][0]
+                
+            title = info.get('title', 'Video')
+            # محاولة قراءة الحجم من البيانات الوصفية
             size = info.get('filesize_approx') or info.get('filesize') or 0
             return title, size
-    except:
+    except Exception as e:
         return None, 0
 
 def download_worker(client, chat_id, message_id, url, quality, is_audio):
-    # تصفير علم الإلغاء عند البدء
     cancel_flags[chat_id] = False
-    
     unique_id = uuid.uuid4().hex[:8]
     output_template = f"{DOWNLOAD_DIR}/{unique_id}_%(title)s.%(ext)s"
     
-    # تمرير chat_id للخطاف
     ydl_opts = {
         "outtmpl": output_template,
         "quiet": True, "nocheckcertificate": True, "restrictfilenames": True,
-        "progress_hooks": [lambda d: download_hook(d, chat_id)], 
+        "progress_hooks": [lambda d: download_hook(d, chat_id)], # تفعيل الحارس
     }
     if os.path.exists(COOKIES_FILE): ydl_opts["cookiefile"] = COOKIES_FILE
 
@@ -188,19 +184,18 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
                 final_path = ydl.prepare_filename(info)
                 if is_audio: final_path = final_path.rsplit(".", 1)[0] + ".mp3"
 
-        # مرحلة الضغط
         if not is_audio and final_path and os.path.exists(final_path):
             f_size = os.path.getsize(final_path)
             if f_size > MAX_FILE_SIZE:
                 os.remove(final_path)
-                return None, None, "File too big!"
-            
+                return None, None, f"الملف ({format_bytes(f_size)}) أكبر من الحد المسموح."
+
             if f_size > COMPRESSION_THRESHOLD:
-                # تحديث الرسالة مع زر الإلغاء
                 client.loop.call_soon_threadsafe(
-                    asyncio.create_task, 
+                    asyncio.create_task,
                     client.edit_message_text(
-                        chat_id, message_id, "🔨 جاري الضغط...",
+                        chat_id, message_id, 
+                        f"🔨 **الحجم {format_bytes(f_size)}**\nجاري الضغط...",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
                     )
                 )
@@ -210,14 +205,12 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
 
     except UserCancelledError:
         return None, None, "🛑 تم الإلغاء."
-    except FileTooBigError:
-        return None, None, "⛔ توقف: الملف تجاوز 900MB."
+    except FileTooBigError as e:
+        return None, None, f"⛔ توقف التحميل: الملف تجاوز 900MB."
     except Exception as e:
         return None, None, str(e)
     finally:
-        # تنظيف علم الإلغاء
-        if chat_id in cancel_flags:
-            del cancel_flags[chat_id]
+        if chat_id in cancel_flags: del cancel_flags[chat_id]
 
 # ================= 5. المعالجات =================
 
@@ -229,93 +222,82 @@ async def start(client, message):
 async def clear(client, message):
     if os.path.exists(DOWNLOAD_DIR): shutil.rmtree(DOWNLOAD_DIR)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await message.reply_text("✅ تم التنظيف")
+    await message.reply_text("✅ تم")
 
 @app.on_message(filters.text & filters.regex(r"http"))
 async def link_handler(client, message):
     url = message.text.strip()
-    status = await message.reply_text("🔎 جاري فحص الرابط...")
-
+    # 1. إشعار الفحص
+    status = await message.reply_text("🔎 **جاري فحص الرابط والحجم (بدون تحميل)...**")
+    
     loop = asyncio.get_event_loop()
+    # 2. تشغيل الجاسوس
     title, size = await loop.run_in_executor(executor, info_worker, url)
 
     await status.delete()
 
-    if not title:
-        await message.reply_text("❌ الرابط غير صالح.")
-        return
+    if not title: return await message.reply_text("❌ رابط غير صالح")
 
     user_pending_data[message.chat.id] = {"url": url}
-    size_txt = format_bytes(size) if size > 0 else "غير معروف"
-    
-    keyboard = InlineKeyboardMarkup([
+    size_txt = format_bytes(size)
+
+    # 3. اتخاذ القرار قبل عرض الأزرار
+    if size > MAX_FILE_SIZE:
+        await message.reply_text(f"⛔ **توقف!** الملف حجمه ({size_txt}) وهو أكبر من حد السيرفر (900MB).\nلن يتم التحميل حفاظاً على الموارد.")
+        return
+
+    msg_text = f"📺 **{title}**\n💾 الحجم المتوقع: {size_txt}\n⬇️ اختر الجودة:"
+    if size == 0: msg_text += "\n⚠️ (الحجم غير معروف، سيتم مراقبته أثناء التحميل)"
+
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 MP3", callback_data="audio"), InlineKeyboardButton("🎥 Best", callback_data="vid_best")],
         [InlineKeyboardButton("🎥 720p", callback_data="vid_720"), InlineKeyboardButton("🎥 360p", callback_data="vid_360")]
     ])
-
-    await message.reply_text(
-        f"📺 **العنوان:** {title}\n💾 **الحجم:** {size_txt}\n\n⬇️ اختر الجودة:",
-        reply_markup=keyboard
-    )
+    
+    await message.reply_text(msg_text, reply_markup=kb)
 
 @app.on_callback_query()
 async def callback(client, call):
-    # 1. معالجة زر الإلغاء
     if call.data == "cancel_dl":
         cancel_flags[call.message.chat.id] = True
-        await call.answer("🛑 جاري الإلغاء...")
-        await call.message.edit_text("🛑 تم إلغاء العملية.")
+        await call.answer("جاري الإلغاء...")
         return
 
-    # 2. معالجة بدء التحميل
     data = user_pending_data.get(call.message.chat.id)
-    if not data: return await call.answer("أرسل الرابط مجدداً", show_alert=True)
-    
+    if not data: return await call.answer("قديم", show_alert=True)
+
     url = data["url"]
     is_audio = (call.data == "audio")
     quality = call.data.split("_")[1] if "vid" in call.data else "720"
 
-    # إضافة زر الإلغاء أثناء التحميل
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
     await call.message.edit_text("⏳ جاري التحميل...", reply_markup=cancel_btn)
-    
-    loop = asyncio.get_event_loop()
-    path, title, err = await loop.run_in_executor(executor, download_worker, client, call.message.chat.id, call.message.id, url, quality, is_audio)
 
-    if err: 
-        if "تم الإلغاء" in str(err):
-            # تم الإلغاء بالفعل، لا داعي لعمل شيء إضافي
-            pass
-        else:
-            await call.message.edit_text(f"❌ خطأ: {err}")
-        # تنظيف الملف الجزئي إذا وجد
+    loop = asyncio.get_event_loop()
+    path, title, err = await loop.run_in_executor(
+        executor, download_worker, client, call.message.chat.id, call.message.id, url, quality, is_audio
+    )
+
+    if err:
         if path and os.path.exists(path): os.remove(path)
-        return
-        
-    if not path: return await call.message.edit_text("❌ فشل التحميل")
+        return await call.message.edit_text(f"❌ {err}")
+    
+    if not path: return await call.message.edit_text("❌ فشل غير معروف")
 
     try:
         await call.message.edit_text("⬆️ جاري الرفع...", reply_markup=cancel_btn)
-        capt = f"🎬 {title}\n🤖 @YourBot"
-        action = enums.ChatAction.UPLOAD_DOCUMENT
-        await client.send_chat_action(call.message.chat.id, action)
-        
-        # تمرير chat_id لدالة البروجرس للتحقق من الإلغاء
         args = (call.message, [time.time(), time.time()], call.message.chat.id)
         
-        if is_audio: await client.send_audio(call.message.chat.id, path, caption=capt, title=title, progress=progress_bar, progress_args=args)
-        else: await client.send_video(call.message.chat.id, path, caption=capt, supports_streaming=True, progress=progress_bar, progress_args=args)
+        if is_audio: await client.send_audio(call.message.chat.id, path, caption=title, progress=progress_bar, progress_args=args)
+        else: await client.send_video(call.message.chat.id, path, caption=title, supports_streaming=True, progress=progress_bar, progress_args=args)
         
         await call.message.delete()
     except Exception as e:
-        if cancel_flags.get(call.message.chat.id):
-             await call.message.edit_text("🛑 تم الإلغاء أثناء الرفع.")
-        else:
-             await call.message.edit_text(f"❌ فشل الرفع: {e}")
+        if not cancel_flags.get(call.message.chat.id):
+            await call.message.edit_text(f"❌ فشل الرفع: {e}")
     finally:
         if os.path.exists(path): os.remove(path)
 
 if __name__ == "__main__":
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    print("🚀 Bot Started with Cancel Feature...")
     app.run()
