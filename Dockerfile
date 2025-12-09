@@ -1,32 +1,24 @@
-# استخدام نسخة بايثون خفيفة (Slim) لتقليل حجم الصورة وسرعة البناء
+# استخدام نسخة بايثون خفيفة
 FROM python:3.10-slim
 
-# إعداد متغيرات البيئة لمنع بايثون من إنشاء ملفات pyc وتفعيل الإخراج المباشر
+# إعداد متغيرات البيئة
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# تحديد مجلد العمل داخل الحاوية
+# تحديد مجلد العمل
 WORKDIR /app
 
-# تحديث النظام وتثبيت FFmpeg (الخطوة الأهم لدمج الصوت والفيديو)
+# تثبيت FFmpeg في طبقة واحدة لتقليل الحجم
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# نسخ ملف المتطلبات أولاً (للاستفادة من كاش Docker)
+# نسخ ملف المتطلبات وتثبيت المكتبات أولاً
 COPY requirements.txt .
-
-# تثبيت مكتبات بايثون
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي ملفات المشروع (الكود)
+# نسخ باقي كود المشروع
 COPY . .
 
-# التأكد من وجود مجلد التحميلات (اختياري لأن الكود ينشئه، لكن جيد للتنظيم)
-RUN mkdir -p downloads
-
-# نسخ باقي ملفات المشروع
-COPY . .
-
-# أمر تشغيل البوت (تم التعديل إلى bot.py)
+# أمر التشغيل
 CMD ["python", "bot.py"]
