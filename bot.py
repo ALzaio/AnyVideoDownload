@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-# مكتبات تيليجرام (Pyrogram - الأسرع)
+# مكتبات تيليجرام (Pyrogram)
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 
@@ -16,30 +16,29 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 import yt_dlp
 
 # ================= 1. الإعدادات والتوكن =================
-# يجب الحصول على API_ID و API_HASH من https://my.telegram.org
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# مجلد التحميلات
+# إعدادات المجلدات والحدود (مخصصة لسيرفر Railway الضعيف)
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 2GB حد تيليجرام
-COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم محاولة ضغطه)
+MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (لحماية القرص 1GB)
+COMPRESSION_THRESHOLD = 50 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
 
 # إعداد السجل (Logging)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # إنشاء العميل
-app = Client("super_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# تخزين الروابط مؤقتاً لربطها باختيار المستخدم
+# تخزين الروابط مؤقتاً
 user_pending_links = {}
 
-# executor لتشغيل المهام الثقيلة في الخلفية
+# executor محدود بـ 2 فقط لحماية الرامات والمعالج
 executor = ThreadPoolExecutor(max_workers=2)
 
-# ================= 2. التعامل مع الكوكيز (من الكود الأول) =================
+# ================= 2. التعامل مع الكوكيز =================
 COOKIES_FILE = "cookies.txt"
 cookies_content = os.environ.get("COOKIES_CONTENT")
 if cookies_content:
@@ -50,9 +49,10 @@ if cookies_content:
     except Exception as e:
         logger.error(f"⚠️ Error creating cookies: {e}")
 
-# ================= 3. دوال مساعدة (ضغط وفورمات) =================
+# ================= 3. دوال مساعدة =================
 
 def format_bytes(size):
+    """تحويل الحجم إلى صيغة مقروءة (MB, GB)"""
     power = 2**10
     n = 0
     power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
@@ -61,42 +61,45 @@ def format_bytes(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-# دالة ضغط الفيديو (من الكود الأول) لتقليل الحجم
 def compress_video(input_path):
-    # إذا الملف أصغر من 50 ميجا، لا تضغطه
-    if os.path.getsize(input_path) <= COMPRESSION_THRESHOLD:
+    """ضغط الفيديو باستخدام FFmpeg"""
+    size = os.path.getsize(input_path)
+    # إذا الملف أصغر من الحد المسموح، لا تضغطه
+    if size <= COMPRESSION_THRESHOLD:
         return input_path
 
     output_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
     ffmpeg_path = shutil.which("ffmpeg")
     
     if not ffmpeg_path:
-        return input_path # FFmpeg غير موجود
+        return input_path 
 
-    # إعدادات ضغط سريعة ومتوازنة
+    # إعدادات ضغط متوازنة (CRF 30)
     cmd = [
         ffmpeg_path, "-i", input_path,
         "-vcodec", "libx264", "-preset", "superfast", 
-        "-crf", "30", # جودة متوسطة لتقليل الحجم
+        "-crf", "30", 
         "-acodec", "aac", "-b:a", "128k",
         output_path
     ]
     
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
-        # التحقق هل الضغط نجح وكان الملف الناتج أصغر
-        if os.path.exists(output_path) and os.path.getsize(output_path) < os.path.getsize(input_path):
+        # مهلة 300 ثانية (5 دقائق) للضغط لتجنب تعليق السيرفر
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) < size:
             os.remove(input_path) # حذف الأصلي
             return output_path
+    except subprocess.TimeoutExpired:
+        logger.warning("Compression timed out, returning original file.")
     except Exception as e:
         logger.error(f"Compression failed: {e}")
     
     return input_path
 
-# شريط التقدم للرفع (ميزة Pyrogram)
-async def progress_bar(current, total, message: Message, start_time):
+async def progress_bar(current, total, message, start_time):
+    """شريط تقدم للرفع فقط (Upload Progress)"""
     now = time.time()
-    # تحديث الرسالة كل 5 ثواني فقط لتجنب الحظر
     if (now - start_time[0]) < 5: 
         return
     
@@ -110,16 +113,19 @@ async def progress_bar(current, total, message: Message, start_time):
         await message.edit_text(
             f"⬆️ **جاري الرفع...**\n"
             f"{bar} {percent:.1f}%\n"
-            f"📦 الحجم: {format_bytes(current)} / {format_bytes(total)}\n"
-            f"🚀 السرعة: {format_bytes(speed)}/s"
+            f"📦 {format_bytes(current)} / {format_bytes(total)}\n"
+            f"🚀 {format_bytes(speed)}/s"
         )
     except:
         pass
 
-# ================= 4. منطق التحميل (Core Logic) =================
+# ================= 4. العامل (Worker) - تحميل وضغط =================
 
-def download_worker(url, quality, is_audio):
-    """هذه الدالة تعمل في Thread منفصل لأنها متزامنة (Blocking)"""
+def download_worker(client, chat_id, message_id, url, quality, is_audio):
+    """
+    هذه الدالة تعمل في الخلفية (Thread).
+    تقوم بالتحميل، وإذا كان الملف كبيراً تقوم بتحديث الرسالة ثم الضغط.
+    """
     
     unique_id = uuid.uuid4().hex[:8]
     output_template = f"{DOWNLOAD_DIR}/{unique_id}_%(title)s.%(ext)s"
@@ -129,10 +135,9 @@ def download_worker(url, quality, is_audio):
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
-        "restrictfilenames": True, # لتجنب الأسماء الغريبة
+        "restrictfilenames": True,
     }
 
-    # إضافة الكوكيز إذا وجدت
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
 
@@ -146,11 +151,9 @@ def download_worker(url, quality, is_audio):
             }],
         })
     else:
-        # منطق اختيار الجودة (من الكود الأول)
         if quality == "best":
             ydl_opts["format"] = "bestvideo+bestaudio/best"
         else:
-            # محاولة جلب الجودة المطلوبة أو أقل، مع دمج الصوت
             ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         ydl_opts["merge_output_format"] = "mp4"
 
@@ -158,11 +161,12 @@ def download_worker(url, quality, is_audio):
     file_title = "Unknown"
 
     try:
+        # 1. مرحلة التحميل
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # التحقق من المعلومات أولاً (اختياري لتسريع العملية)
             info = ydl.extract_info(url, download=True)
             file_title = info.get('title', 'Video')
             
-            # تحديد مسار الملف الناتج
             if 'requested_downloads' in info:
                 final_path = info['requested_downloads'][0]['filepath']
             else:
@@ -170,39 +174,62 @@ def download_worker(url, quality, is_audio):
                 if is_audio and not final_path.endswith(".mp3"):
                     final_path = final_path.rsplit(".", 1)[0] + ".mp3"
 
-        # مرحلة الضغط (فقط للفيديو)
+        # 2. مرحلة التحقق والضغط (التعديل المطلوب)
         if not is_audio and final_path and os.path.exists(final_path):
-            final_path = compress_video(final_path)
+            file_size = os.path.getsize(final_path)
+            
+            # حماية القرص: إذا الملف أكبر من 900 ميجا احذفه فوراً
+            if file_size > MAX_FILE_SIZE:
+                os.remove(final_path)
+                return None, None, f"عذراً، الملف ({format_bytes(file_size)}) أكبر من حد السيرفر المسموح (900MB)."
+
+            # إذا الملف أكبر من 50 ميجا -> تنبيه المستخدم ثم الضغط
+            if file_size > COMPRESSION_THRESHOLD:
+                msg_text = (
+                    f"⚙️ **جاري المعالجة...**\n"
+                    f"📁 الحجم الأصلي: {format_bytes(file_size)}\n"
+                    f"🔨 يتم الآن ضغط الفيديو لتقليل الحجم...\n"
+                    f"⚠️ قد تستغرق العملية بضع دقائق، يرجى الانتظار."
+                )
+                
+                # إرسال التحديث من الـ Thread إلى Pyrogram
+                client.loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=msg_text
+                    )
+                )
+                
+                # بدء الضغط
+                final_path = compress_video(final_path)
 
         return final_path, file_title, None
 
     except Exception as e:
         return None, None, str(e)
 
-# ================= 5. معالجات البوت (Handlers) =================
+# ================= 5. معالجات البوت =================
 
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client, message):
     await message.reply_text(
-        "👋 **أهلاً بك في البوت المتكامل!**\n\n"
-        "أرسل رابط فيديو (يوتيوب، فيسبوك، انستا، تيك توك...) وسأقوم بتحميله.\n"
-        "🔹 أدعم اختيار الجودة (1080p, 720p, 360p).\n"
-        "🔹 أدعم تحويل الصوت (MP3).\n"
+        "👋 **أهلاً بك!**\n"
+        "أرسل رابط فيديو للتحميل.\n"
+        "🔹 أدعم: يوتيوب، تيك توك، فيسبوك، انستقرام.\n"
         "🔹 أقوم بضغط الفيديوهات الكبيرة تلقائياً.\n"
-        "🧹 للأوامر: /clear لتنظيف المحادثة."
+        "🧹 أمر التنظيف: /clear"
     )
 
 @app.on_message(filters.command("clear"))
 async def clear_handler(client, message):
     try:
-        await message.reply_text("🗑️ جاري التنظيف...")
-        # حذف المجلد المؤقت
+        await message.reply_text("🗑️ جاري تنظيف السيرفر...")
         if os.path.exists(DOWNLOAD_DIR):
             shutil.rmtree(DOWNLOAD_DIR)
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        # حذف الرسائل (اختياري)
-        msg_ids = [message.id + i for i in range(-20, 2)]
-        await client.delete_messages(message.chat.id, msg_ids)
+        await message.reply_text("✅ تم التنظيف!")
     except:
         pass
 
@@ -211,11 +238,10 @@ async def link_handler(client, message):
     url = message.text.strip()
     user_pending_links[message.chat.id] = url
     
-    # لوحة أزرار اختيار الجودة (من الكود الأول)
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎵 MP3 (صوت)", callback_data="audio"),
-            InlineKeyboardButton("🎥 Best", callback_data="vid_best")
+            InlineKeyboardButton("🎥 Best Quality", callback_data="vid_best")
         ],
         [
             InlineKeyboardButton("🎥 1080p", callback_data="vid_1080"),
@@ -225,7 +251,7 @@ async def link_handler(client, message):
     ])
     
     await message.reply_text(
-        "⬇️ **تم استلام الرابط!**\nاختر الجودة المطلوبة:",
+        "⬇️ **تم استلام الرابط!** اختر الجودة:",
         reply_markup=keyboard,
         quote=True
     )
@@ -233,44 +259,43 @@ async def link_handler(client, message):
 @app.on_callback_query()
 async def callback_handler(client, callback):
     chat_id = callback.message.chat.id
+    message_id = callback.message.id
     data = callback.data
     url = user_pending_links.get(chat_id)
 
     if not url:
-        await callback.answer("❌ الرابط انتهى، أرسله مجدداً.", show_alert=True)
+        await callback.answer("❌ الرابط منتهي الصلاحية.", show_alert=True)
         return
 
-    # تحديد الإعدادات بناءً على الزر
-    is_audio = False
-    quality = "720"
-    
-    if data == "audio":
-        is_audio = True
-    elif data.startswith("vid_"):
-        quality = data.split("_")[1]
+    is_audio = (data == "audio")
+    quality = data.split("_")[1] if data.startswith("vid_") else "720"
 
-    # حذف الأزرار وتحديث الرسالة
-    await callback.message.edit_text(f"⏳ **جاري التحميل والمعالجة...**\n⚙️ الجودة: {quality if not is_audio else 'MP3'}")
+    # تحديث الرسالة إلى "جاري التحميل"
+    await callback.message.edit_text(f"⏳ **جاري التحميل من المصدر...**\n⚙️ النوع: {quality if not is_audio else 'MP3'}")
     
-    # بدء التحميل في الخلفية (Thread)
     loop = asyncio.get_event_loop()
-    # نستخدم executor لتجنب تجميد البوت
+    
+    # تشغيل العامل (Worker) في الخلفية
+    # نمرر client, chat_id, message_id ليتمكن من تحديث الرسالة عند الضغط
     file_path, title, error = await loop.run_in_executor(
-        executor, download_worker, url, quality, is_audio
+        executor, download_worker, client, chat_id, message_id, url, quality, is_audio
     )
 
-    if error or not file_path or not os.path.exists(file_path):
-        await callback.message.edit_text(f"❌ فشل التحميل: {error or 'Unknown Error'}")
+    if error:
+        await callback.message.edit_text(f"❌ خطأ: {error}")
+        return
+        
+    if not file_path or not os.path.exists(file_path):
+        await callback.message.edit_text("❌ لم يتم العثور على الملف بعد التحميل.")
         return
 
     # الرفع إلى تيليجرام
     try:
-        await callback.message.edit_text("⬆️ **جاري الرفع...**")
-        start_time = [time.time(), time.time()] # للتحكم في تحديث البروجرس
+        await callback.message.edit_text("⬆️ **جاري الرفع إلى تيليجرام...**")
+        start_time = [time.time(), time.time()]
         
-        caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via @TikInstaDL_bot"
+        caption = f"🎬 **{title}**\n⚙️ Quality: {quality if not is_audio else 'MP3'}\n🤖 via Bot"
         
-        # إرسال Action (جاري رفع ملف...)
         await client.send_chat_action(chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
 
         if is_audio:
@@ -292,16 +317,18 @@ async def callback_handler(client, callback):
                 progress_args=(callback.message, start_time)
             )
         
-        await callback.message.delete() # حذف رسالة الانتظار
+        await callback.message.delete()
         
     except Exception as e:
         logger.error(f"Upload Error: {e}")
-        await callback.message.edit_text(f"❌ خطأ أثناء الرفع: {e}")
+        await callback.message.edit_text(f"❌ فشل الرفع: {e}")
     
     finally:
-        # تنظيف الملف
+        # تنظيف الملف دائماً
         if os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except: pass
 
 # ================= 6. التشغيل =================
 
@@ -309,11 +336,9 @@ if __name__ == "__main__":
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
     
-    # التحقق من وجود FFmpeg
-    if not shutil.which("ffmpeg"):
-        logger.warning("⚠️ FFmpeg not found! Compression and MP3 conversion might fail.")
-
-    print("🚀 Super Bot is Running...")
+    print("🚀 Bot is running on Railway...")
     app.run()
+    app.run()
+
 
 
