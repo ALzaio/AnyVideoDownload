@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # إعدادات المجلدات والحدود (مخصصة لسيرفر Railway الضعيف)
 DOWNLOAD_DIR = "downloads"
 MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB (لحماية القرص 1GB)
-COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
+COMPRESSION_THRESHOLD = 300 * 1024 * 1024  # 50MB (أي ملف أكبر سيتم ضغطه)
 
 # إعداد السجل (Logging)
 logging.basicConfig(level=logging.INFO)
@@ -345,6 +345,7 @@ if __name__ == "__main__":
     print("🚀 Bot is running on Railway...")
     app.run()
     app.run()
+
 
 
 
