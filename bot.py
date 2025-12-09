@@ -62,7 +62,7 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 def compress_video(input_path):
-    """ضغط الفيديو باستخدام FFmpeg"""
+    """ضغط الفيديو باستخدام FFmpeg مع إصلاح مشكلة التشغيل"""
     size = os.path.getsize(input_path)
     # إذا الملف أصغر من الحد المسموح، لا تضغطه
     if size <= COMPRESSION_THRESHOLD:
@@ -74,24 +74,25 @@ def compress_video(input_path):
     if not ffmpeg_path:
         return input_path 
 
-    # إعدادات ضغط متوازنة (CRF 30)
-   cmd = [
+    # إعدادات ضغط متوازنة مع إصلاح صيغة الألوان
+    cmd = [
         ffmpeg_path, "-i", input_path,
         "-vcodec", "libx264", 
         "-preset", "superfast", 
         "-crf", "30", 
-        "-pix_fmt", "yuv420p",   # <--- ⚠️ هذا هو السطر السحري للإصلاح
+        "-pix_fmt", "yuv420p", 
         "-acodec", "aac", 
         "-b:a", "128k",
-        "-movflags", "+faststart", # <--- يجعل الفيديو يعمل فوراً دون انتظار التحميل الكامل
+        "-movflags", "+faststart",
         output_path
     ]
     
     try:
-        # مهلة 300 ثانية (5 دقائق) للضغط لتجنب تعليق السيرفر
+        # مهلة 5 دقائق
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
         
-        if os.path.exists(output_path) and os.path.getsize(output_path) < size:
+        # التحقق من نجاح الضغط
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             os.remove(input_path) # حذف الأصلي
             return output_path
     except subprocess.TimeoutExpired:
@@ -99,6 +100,7 @@ def compress_video(input_path):
     except Exception as e:
         logger.error(f"Compression failed: {e}")
     
+    # في حالة الفشل نعود للملف الأصلي
     return input_path
 
 async def progress_bar(current, total, message, start_time):
@@ -343,6 +345,7 @@ if __name__ == "__main__":
     print("🚀 Bot is running on Railway...")
     app.run()
     app.run()
+
 
 
 
