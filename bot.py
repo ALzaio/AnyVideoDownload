@@ -20,10 +20,14 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# حدود Railway
+# حدود Railway المعدلة حسب طلبك
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 900 * 1024 * 1024  # 900MB
-COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 200MB
+
+# 🚨 التعديل الأساسي: الحد الأقصى أصبح 300 ميجابايت
+MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB
+
+# 🚨 تعديل عتبة الضغط: نضغط الملفات التي بين 150 و 300 ميجا
+COMPRESSION_THRESHOLD = 150 * 1024 * 1024  # 150MB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,6 +69,7 @@ def download_hook(d, chat_id):
             raise FileTooBigError(f"تجاوز الحد: {format_bytes(d['downloaded_bytes'])}")
 
 def compress_video(input_path, chat_id):
+    """دالة ضغط الفيديو باستخدام FFmpeg"""
     size = os.path.getsize(input_path)
     if size <= COMPRESSION_THRESHOLD: return input_path
 
@@ -72,6 +77,7 @@ def compress_video(input_path, chat_id):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg: return input_path 
 
+    # إعدادات ضغط سريعة (Ultrafast) لتقليل استهلاك المعالج
     cmd = [
         ffmpeg, "-i", input_path,
         "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "35",
@@ -154,7 +160,8 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
     }
     if os.path.exists(COOKIES_FILE): ydl_opts["cookiefile"] = COOKIES_FILE
 
-    if is_audio: ydl_opts.update({"format": "bestaudio/best", "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
+    if is_audio: 
+        ydl_opts.update({"format": "bestaudio/best", "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
     else:
         if quality == "best": ydl_opts["format"] = "bestvideo+bestaudio/best"
         else: ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
@@ -172,14 +179,17 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
 
         if not is_audio and final_path and os.path.exists(final_path):
             f_size = os.path.getsize(final_path)
+            # فحص أخير للحجم بعد التحميل
             if f_size > MAX_FILE_SIZE:
                 os.remove(final_path)
-                return None, None, f"الملف ({format_bytes(f_size)}) أكبر من الحد."
+                return None, None, f"الملف ({format_bytes(f_size)}) أكبر من الحد المسموح ({format_bytes(MAX_FILE_SIZE)})."
+            
+            # ضغط الفيديو إذا كان حجمه أكبر من عتبة الضغط وأقل من الحد الأقصى
             if f_size > COMPRESSION_THRESHOLD:
                 client.loop.call_soon_threadsafe(
                     asyncio.create_task,
                     client.edit_message_text(
-                        chat_id, message_id, f"🔨 **الحجم {format_bytes(f_size)}**\nجاري الضغط...",
+                        chat_id, message_id, f"🔨 **الحجم {format_bytes(f_size)}**\nجاري الضغط لتقليل الحجم...",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
                     )
                 )
@@ -196,43 +206,48 @@ def download_worker(client, chat_id, message_id, url, quality, is_audio):
 
 @app.on_message(filters.command(["start"]))
 async def start(client, message):
-    await message.reply_text("👋 أهلاً! أرسل رابطاً للمتابعة.")
+    await message.reply_text("👋 أهلاً! أرسل رابط فيديو (يوتيوب، فيسبوك، انستقرام...)")
 
 @app.on_message(filters.command("clear"))
 async def clear(client, message):
     if os.path.exists(DOWNLOAD_DIR): shutil.rmtree(DOWNLOAD_DIR)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await message.reply_text("✅ تم")
+    await message.reply_text("✅ تم تنظيف المخلفات")
 
 @app.on_message(filters.text & filters.regex(r"http"))
 async def link_handler(client, message):
     url = message.text.strip()
-    status = await message.reply_text("🔎 **جاري فحص الرابط والحجم...**")
+    status = await message.reply_text("🔎 **جاري فحص الرابط...**")
     
     loop = asyncio.get_event_loop()
     title, size = await loop.run_in_executor(executor, info_worker, url)
     await status.delete()
 
-    if not title: return await message.reply_text("❌ رابط غير صالح")
+    if not title: return await message.reply_text("❌ رابط غير صالح أو محتوى خاص")
 
     user_pending_data[message.chat.id] = {"url": url}
     size_txt = format_bytes(size)
 
-    # التحقق من الحجم قبل عرض الخيارات
-    warning = ""
+    # 🚨 منطق الشرط الجديد: 300MB 🚨
     if size > MAX_FILE_SIZE:
-        warning = f"\n⚠️ **تنبيه:** الحجم ({size_txt}) أكبر من 900MB.\nخيار 'التحميل' سيفشل غالباً، يفضل استخدام 'المشاهدة المباشرة'."
+        # الحالة الأولى: الملف ضخم جداً -> عرض خيار المشاهدة فقط
+        warning = f"\n⚠️ **تنبيه:** الحجم ({size_txt}) أكبر من 300MB.\n⚠️ لا يمكن تحميل هذا الملف لسيرفرات تيليجرام مباشرة.\n✅ **الحل:** استخدم الرابط المباشر أدناه."
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ مشاهدة مباشرة (Direct Link)", callback_data="method_stream")]
+        ])
+    else:
+        # الحالة الثانية: الملف ضمن الحدود المسموحة -> عرض كل الخيارات
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📥 تحميل للمحادثة", callback_data="method_download"),
+                InlineKeyboardButton("▶️ رابط مباشر", callback_data="method_stream")
+            ]
+        ])
+        warning = ""
 
-    # لوحة الخيارات الجديدة (الخطوة الأولى)
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📥 تحميل للمحادثة (ملف)", callback_data="method_download"),
-            InlineKeyboardButton("▶️ رابط مباشر (سريع)", callback_data="method_stream")
-        ]
-    ])
-    
     await message.reply_text(
-        f"📺 **{title}**\n💾 الحجم المتوقع: {size_txt}{warning}\n\n⬇️ **كيف تود المتابعة؟**",
+        f"📺 **{title}**\n💾 الحجم المتوقع: {size_txt}{warning}",
         reply_markup=kb
     )
 
@@ -244,18 +259,18 @@ async def callback(client, call):
         return
 
     data = user_pending_data.get(call.message.chat.id)
-    if not data: return await call.answer("قديم", show_alert=True)
+    if not data: return await call.answer("انتهت جلسة هذا الرابط، أرسله مجدداً", show_alert=True)
     url = data["url"]
 
     # --- مسار 1: المشاهدة المباشرة ---
     if call.data == "method_stream":
-        await call.message.edit_text("⏳ **جاري جلب رابط البث...**")
+        await call.message.edit_text("⏳ **جاري استخراج رابط البث...**")
         loop = asyncio.get_event_loop()
         stream_url, title = await loop.run_in_executor(executor, get_stream_link_worker, url)
         
         if stream_url:
             await call.message.edit_text(
-                f"✅ **تم جلب الرابط!**\n🎬 {title}\n\n🔗 [اضغط هنا للمشاهدة]({stream_url})\n\n⚠️ هذا الرابط صالح لفترة محدودة، ويعمل بدون VPN غالباً.",
+                f"✅ **تم جلب الرابط!**\n🎬 {title}\n\n🔗 [اضغط هنا للمشاهدة]({stream_url})\n\n⚠️ الرابط يعمل لفترة مؤقتة ويدعم السرعات العالية.",
                 disable_web_page_preview=True
             )
         else:
@@ -265,18 +280,18 @@ async def callback(client, call):
     # --- مسار 2: التحميل (عرض الجودات) ---
     if call.data == "method_download":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 MP3", callback_data="audio"), InlineKeyboardButton("🎥 Best", callback_data="vid_best")],
+            [InlineKeyboardButton("🎵 صوت (MP3)", callback_data="audio"), InlineKeyboardButton("🎥 فيديو (Best)", callback_data="vid_best")],
             [InlineKeyboardButton("🎥 720p", callback_data="vid_720"), InlineKeyboardButton("🎥 360p", callback_data="vid_360")]
         ])
-        await call.message.edit_text("⬇️ اختر الجودة للتحميل:", reply_markup=kb)
+        await call.message.edit_text("⬇️ اختر الجودة:", reply_markup=kb)
         return
 
-    # --- مسار 3: التنفيذ (بعد اختيار الجودة) ---
+    # --- مسار 3: التنفيذ ---
     is_audio = (call.data == "audio")
     quality = call.data.split("_")[1] if "vid" in call.data else "720"
 
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
-    await call.message.edit_text("⏳ جاري التحميل والمراقبة...", reply_markup=cancel_btn)
+    await call.message.edit_text("⏳ جاري التحميل إلى السيرفر...", reply_markup=cancel_btn)
 
     loop = asyncio.get_event_loop()
     path, title, err = await loop.run_in_executor(
@@ -285,12 +300,12 @@ async def callback(client, call):
 
     if err:
         if path and os.path.exists(path): os.remove(path)
-        return await call.message.edit_text(f"❌ {err}")
+        return await call.message.edit_text(f"❌ خطأ: {err}")
     
     if not path: return await call.message.edit_text("❌ فشل غير معروف")
 
     try:
-        await call.message.edit_text("⬆️ جاري الرفع...", reply_markup=cancel_btn)
+        await call.message.edit_text("⬆️ جاري الرفع إلى تيليجرام...", reply_markup=cancel_btn)
         args = (call.message, [time.time(), time.time()], call.message.chat.id)
         
         if is_audio: await client.send_audio(call.message.chat.id, path, caption=title, progress=progress_bar, progress_args=args)
