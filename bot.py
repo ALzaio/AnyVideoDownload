@@ -16,14 +16,20 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError, GeoRestrictedError
 
+# 🆕 1. مكتبة السيرفر (الجزء الجديد)
+from aiohttp import web
+
 # ================= 1. الإعدادات =================
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# 🆕 إعداد المنفذ (Port) ليتمكن Railway من الاتصال
+PORT = int(os.environ.get("PORT", 8080))
+
 DOWNLOAD_DIR = "downloads"
-MAX_FILE_SIZE = 400 * 1024 * 1024  # 300MB
-COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 150MB
+MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB
+COMPRESSION_THRESHOLD = 150 * 1024 * 1024  # 150MB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,7 +49,24 @@ if cookies_content:
             f.write(cookies_content)
     except: pass
 
-# ================= 3. دوال مساعدة وتنظيف =================
+# ================= 3. دوال السيرفر (الجزء الجديد) =================
+
+async def health_check_handler(request):
+    """صفحة الويب التي يزورها موقع المراقبة"""
+    return web.Response(text="Bot is running!", status=200)
+
+async def start_web_server():
+    """تشغيل سيرفر الويب في الخلفية"""
+    server = web.Application()
+    server.router.add_get("/", health_check_handler)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    # الاستماع على جميع الاتصالات (0.0.0.0)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🌍 Web server started on port {PORT}")
+
+# ================= 4. دوال مساعدة وتنظيف =================
 
 def format_bytes(size):
     if not size or size == 0: return "N/A"
@@ -61,8 +84,8 @@ class UserCancelledError(Exception): pass
 async def scheduled_cleanup():
     """مهمة خلفية لتنظيف الملفات القديمة كل ساعة"""
     while True:
-        await asyncio.sleep(3600)  # انتظار ساعة
-        logger.info("🧹 بدء عملية التنظيف المجدولة...")
+        await asyncio.sleep(3600)
+        logger.info("🧹 Starting scheduled cleanup...")
         try:
             now = time.time()
             if os.path.exists(DOWNLOAD_DIR):
@@ -72,7 +95,6 @@ async def scheduled_cleanup():
                         try:
                             if os.path.isfile(filepath): os.remove(filepath)
                             elif os.path.isdir(filepath): shutil.rmtree(filepath)
-                            logger.info(f"Deleted old file: {filename}")
                         except Exception as e:
                             logger.error(f"Error deleting {filename}: {e}")
         except Exception as e:
@@ -82,7 +104,7 @@ def download_hook(d, chat_id):
     if d['status'] == 'downloading':
         if cancel_flags.get(chat_id): raise UserCancelledError("Cancelled")
         if d.get('downloaded_bytes', 0) > MAX_FILE_SIZE:
-            raise FileTooBigError(f"تجاوز الحد: {format_bytes(d['downloaded_bytes'])}")
+            raise FileTooBigError(f"Limit exceeded: {format_bytes(d['downloaded_bytes'])}")
 
 def compress_video(input_path, chat_id):
     size = os.path.getsize(input_path)
@@ -133,10 +155,9 @@ async def progress_bar(current, total, message, start_time, chat_id):
         )
     except: pass
 
-# ================= 4. العمال (Workers) وتحليل الجودة =================
+# ================= 5. العمال (Workers) =================
 
 def analyze_video_worker(url):
-    """جلب تفاصيل الفيديو والجودات المتاحة مع أحجامها"""
     ydl_opts = {
         "quiet": True, "nocheckcertificate": True, "skip_download": True, "noplaylist": True,
         "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
@@ -230,7 +251,7 @@ def download_worker(client, chat_id, message_id, url, quality_setting, is_audio)
     finally:
         if chat_id in cancel_flags: del cancel_flags[chat_id]
 
-# ================= 5. المعالجات =================
+# ================= 6. المعالجات (Handlers) =================
 
 @app.on_message(filters.command(["start"]))
 async def start(client, message):
@@ -252,9 +273,7 @@ async def link_handler(client, message):
     formats = result["formats"]
     user_pending_data[message.chat.id] = {"url": url}
     
-    # بناء الأزرار
     buttons = []
-    # زر الصوت
     buttons.append([InlineKeyboardButton("🎵 تحويل صوت (MP3)", callback_data="start_audio")])
     
     valid_video_options = []
@@ -273,12 +292,10 @@ async def link_handler(client, message):
             size_lbl = format_bytes(size) if size > 0 else "N/A"
             if size > 0 and size > MAX_FILE_SIZE: pass 
             else:
-                # 🚨 هنا التعديل: نرسل الجودة فقط، ثم نسأل عن النوع في الخطوة القادمة
                 btn_txt = f"🎥 {q}p ({size_lbl})"
                 valid_video_options.append(InlineKeyboardButton(btn_txt, callback_data=f"ask_{q}"))
                 has_downloadable_video = True
 
-    # أفضل جودة
     buttons.append([InlineKeyboardButton("✨ أفضل جودة (<300MB)", callback_data="ask_best")])
 
     video_rows = [valid_video_options[i:i+2] for i in range(0, len(valid_video_options), 2)]
@@ -304,7 +321,6 @@ async def callback(client, call):
     if not data: return await call.answer("انتهت الجلسة", show_alert=True)
     url = data["url"]
 
-    # --- مسار 1: رابط مباشر ---
     if call.data == "method_stream":
         await call.message.edit_text("⏳ **جاري استخراج الرابط...**")
         loop = asyncio.get_event_loop()
@@ -315,33 +331,22 @@ async def callback(client, call):
             await call.message.edit_text("❌ فشل استخراج الرابط")
         return
 
-    # --- مسار 2: السؤال عن نوع الملف (جديد) ---
-    # إذا ضغط المستخدم على زر جودة فيديو (مثلاً ask_720)
+    # سؤال عن نوع الملف (فيديو/ملف)
     if call.data.startswith("ask_"):
         quality = call.data.split("_")[1]
-        
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎬 فيديو للمشاهدة (Stream)", callback_data=f"start_vid_{quality}")],
             [InlineKeyboardButton("📁 ملف أصلي (File)", callback_data=f"start_doc_{quality}")]
         ])
-        
-        await call.message.edit_text(
-            f"🛠 **كيف تريد استلام الفيديو ({quality})؟**\n\n"
-            "🎬 **فيديو:** للمشاهدة المباشرة في التطبيق (الأسرع).\n"
-            "📁 **ملف:** للحفاظ على الجودة الأصلية 100% (بدون تعديل).",
-            reply_markup=kb
-        )
+        await call.message.edit_text("🛠 **كيف تريد استلام الملف؟**", reply_markup=kb)
         return
 
-    # --- مسار 3: البدء الفعلي للتحميل ---
-    # يمكن أن يكون start_audio, start_vid_720, start_doc_720
+    # البدء الفعلي
     if not call.data.startswith("start_"): return
 
-    action_parts = call.data.split("_") # ['start', 'vid', '720'] or ['start', 'audio']
-    mode = action_parts[1] # audio, vid, doc
-    
+    action_parts = call.data.split("_")
+    mode = action_parts[1]
     is_audio = (mode == "audio")
-    # إذا كان audio لا توجد جودة، وإذا فيديو نأخذ الجزء الثالث
     quality = action_parts[2] if len(action_parts) > 2 else "best"
 
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_dl")]])
@@ -362,17 +367,14 @@ async def callback(client, call):
         await call.message.edit_text("⬆️ جاري الرفع...", reply_markup=cancel_btn)
         args = (call.message, [time.time(), time.time()], call.message.chat.id)
         
-        # 🚨 منطق الرفع الجديد بناءً على اختيار المستخدم 🚨
         if is_audio:
             await client.send_audio(call.message.chat.id, path, caption=title, progress=progress_bar, progress_args=args)
         elif mode == "doc":
-            # رفع كملف (Document) للحفاظ على الجودة
             await client.send_document(
                 call.message.chat.id, path, caption=title, force_document=True,
                 progress=progress_bar, progress_args=args
             )
         else:
-            # رفع كفيديو (Video) للمشاهدة المباشرة (الوضع الافتراضي)
             await client.send_video(
                 call.message.chat.id, path, caption=title, supports_streaming=True,
                 progress=progress_bar, progress_args=args
@@ -385,16 +387,24 @@ async def callback(client, call):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# ================= 6. التشغيل =================
+# ================= 7. التشغيل (الجزء المعدل للدمج) =================
+
 async def main():
+    # 1. إنشاء المجلد
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    
+    # 2. تشغيل مهمة التنظيف في الخلفية
     asyncio.create_task(scheduled_cleanup())
     
+    # 3. تشغيل السيرفر لفتح الـ Port (مهم جداً)
+    asyncio.create_task(start_web_server())
+    
+    # 4. تشغيل البوت
     logger.info("🤖 Bot started...")
     await app.start()
     await idle()
     await app.stop()
 
 if __name__ == "__main__":
+    # تشغيل الحلقة
     app.run(main())
-
