@@ -29,7 +29,7 @@ PORT = int(os.environ.get("PORT", 8080))
 
 DOWNLOAD_DIR = "downloads"
 MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB
-COMPRESSION_THRESHOLD = 150 * 1024 * 1024  # 150MB
+COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 150MB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -408,3 +408,4 @@ async def main():
 if __name__ == "__main__":
     # تشغيل الحلقة
     app.run(main())
+
