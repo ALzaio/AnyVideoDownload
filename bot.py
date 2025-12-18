@@ -14,9 +14,9 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # مكتبة التحميل ومعالجة الأخطاء
 import yt_dlp
-from yt_dlp.utils import DownloadError, ExtractorError, GeoRestrictedError
+from yt_dlp.utils import DownloadError, GeoRestrictedError
 
-# 🆕 1. مكتبة السيرفر (الجزء الجديد)
+# مكتبة السيرفر (لابقاء البوت يعمل على Railway)
 from aiohttp import web
 
 # ================= 1. الإعدادات =================
@@ -24,12 +24,18 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# 🆕 إعداد المنفذ (Port) ليتمكن Railway من الاتصال
+# إعداد المنفذ (Port)
 PORT = int(os.environ.get("PORT", 8080))
 
 DOWNLOAD_DIR = "downloads"
 MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB
-COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 150MB
+COMPRESSION_THRESHOLD = 200 * 1024 * 1024  # 200MB
+
+# إعدادات التمويه (User Agent) لتجنب حظر تويتر
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,13 +49,17 @@ cancel_flags = {}
 # ================= 2. الكوكيز =================
 COOKIES_FILE = "cookies.txt"
 cookies_content = os.environ.get("COOKIES_CONTENT")
+
 if cookies_content:
     try:
-        with open(COOKIES_FILE, "w") as f:
+        # كتابة الكوكيز عند بدء التشغيل
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
             f.write(cookies_content)
-    except: pass
+        logger.info("✅ Cookies file created successfully.")
+    except Exception as e:
+        logger.error(f"❌ Failed to create cookies file: {e}")
 
-# ================= 3. دوال السيرفر (الجزء الجديد) =================
+# ================= 3. دوال السيرفر (Web Server) =================
 
 async def health_check_handler(request):
     """صفحة الويب التي يزورها موقع المراقبة"""
@@ -61,7 +71,6 @@ async def start_web_server():
     server.router.add_get("/", health_check_handler)
     runner = web.AppRunner(server)
     await runner.setup()
-    # الاستماع على جميع الاتصالات (0.0.0.0)
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"🌍 Web server started on port {PORT}")
@@ -158,9 +167,11 @@ async def progress_bar(current, total, message, start_time, chat_id):
 # ================= 5. العمال (Workers) =================
 
 def analyze_video_worker(url):
+    # إعدادات التحليل مع إضافة الهيدرز والكوكيز
     ydl_opts = {
         "quiet": True, "nocheckcertificate": True, "skip_download": True, "noplaylist": True,
-        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        "http_headers": HTTP_HEADERS  # 🆕 إضافة الهيدرز
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -189,7 +200,9 @@ def analyze_video_worker(url):
 def get_stream_link_worker(url):
     ydl_opts = {
         "quiet": True, "nocheckcertificate": True, "skip_download": True,
-        "format": "best", "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+        "format": "best",
+        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        "http_headers": HTTP_HEADERS  # 🆕 إضافة الهيدرز
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -205,7 +218,9 @@ def download_worker(client, chat_id, message_id, url, quality_setting, is_audio)
     ydl_opts = {
         "outtmpl": output_template, "quiet": True, "nocheckcertificate": True,
         "restrictfilenames": True, "progress_hooks": [lambda d: download_hook(d, chat_id)],
+        "http_headers": HTTP_HEADERS,  # 🆕 إضافة الهيدرز
     }
+    
     if os.path.exists(COOKIES_FILE): ydl_opts["cookiefile"] = COOKIES_FILE
 
     if is_audio: 
@@ -260,6 +275,11 @@ async def start(client, message):
 @app.on_message(filters.text & filters.regex(r"http"))
 async def link_handler(client, message):
     url = message.text.strip()
+    
+    # 🆕 إصلاح مهم: تحويل روابط X.com إلى twitter.com
+    if "x.com" in url:
+        url = url.replace("x.com", "twitter.com")
+        
     status = await message.reply_text("🔎 **جاري تحليل الرابط...**")
     
     loop = asyncio.get_event_loop()
@@ -387,25 +407,18 @@ async def callback(client, call):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# ================= 7. التشغيل (الجزء المعدل للدمج) =================
+# ================= 7. التشغيل =================
 
 async def main():
-    # 1. إنشاء المجلد
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     
-    # 2. تشغيل مهمة التنظيف في الخلفية
     asyncio.create_task(scheduled_cleanup())
-    
-    # 3. تشغيل السيرفر لفتح الـ Port (مهم جداً)
     asyncio.create_task(start_web_server())
     
-    # 4. تشغيل البوت
     logger.info("🤖 Bot started...")
     await app.start()
     await idle()
     await app.stop()
 
 if __name__ == "__main__":
-    # تشغيل الحلقة
     app.run(main())
-
