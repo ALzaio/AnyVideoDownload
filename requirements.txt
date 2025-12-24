@@ -1,4 +1,4 @@
-https://github.com/yt-dlp/yt-dlp/archive/master.zip
+yt-dlp
 pyrogram
 tgcrypto
 aiohttp
