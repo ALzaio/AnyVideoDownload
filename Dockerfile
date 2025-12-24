@@ -1,3 +1,5 @@
+# استبدل السطر القديم في ملف Dockerfile بهذا السطر:
+RUN pip install --no-cache-dir --force-reinstall -r requirements.txt [cite: 3]
 # صورة Python خفيفة وسريعة
 FROM python:3.10-slim-bookworm
 
@@ -31,3 +33,4 @@ COPY . .
 
 # تشغيل البوت
 CMD ["python", "bot.py"]
+
