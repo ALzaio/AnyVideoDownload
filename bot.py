@@ -410,6 +410,7 @@ async def callback(client, call):
 # ================= 7. التشغيل =================
 
 async def main():
+    os.system("pip install -U yt-dlp")
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     
     asyncio.create_task(scheduled_cleanup())
@@ -422,3 +423,4 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
+
