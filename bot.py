@@ -280,6 +280,9 @@ async def link_handler(client, message):
     if "x.com" in url:
         url = url.replace("x.com", "twitter.com")
         
+    if "tiktok.com" in url:
+        url = url.split("?")[0]
+        
     status = await message.reply_text("🔎 **جاري تحليل الرابط...**")
     
     loop = asyncio.get_event_loop()
@@ -423,4 +426,5 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
+
 
